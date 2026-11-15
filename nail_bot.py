@@ -4,17 +4,12 @@ Nail Studio Bot
 Скиньте фото работы → бот напишет пост → нажмите ✅ → опубликуется в канал.
 Каждый понедельник в 9:00 — сводка трендов.
 
-Настройка (три переменные окружения):
-  BOT_TOKEN   — токен от @BotFather
-  OPENAI_KEY  — ключ с platform.openai.com
-  CHANNEL_ID  — @username вашего канала или числовой ID
+Настройка (переменные окружения в Railway):
+  BOT_TOKEN     — токен от @BotFather
+  OPENAI_KEY    — ключ с platform.openai.com
+  CHANNEL_ID    — @username вашего канала или числовой ID
   OWNER_CHAT_ID — ваш числовой ID (для доступа и рассылки)
-
-Запуск локально:
-  pip install python-telegram-bot openai apscheduler
-  BOT_TOKEN=... OPENAI_KEY=... CHANNEL_ID=... OWNER_CHAT_ID=... python nail_bot.py
-
-Деплой на Railway: просто залейте файл, добавьте переменные в Settings → Variables.
+  OPENAI_MODEL  — (необязательно) название модели, по умолчанию gpt-4o-mini
 """
 
 import os, json, logging
@@ -34,6 +29,9 @@ BOT_TOKEN     = os.environ["BOT_TOKEN"]
 OPENAI_KEY    = os.environ["OPENAI_KEY"]
 CHANNEL_ID    = os.environ["CHANNEL_ID"]   # @yourchannel или -1001234567890
 OWNER_CHAT_ID = int(os.environ.get("OWNER_CHAT_ID", "0"))
+
+# Модель по умолчанию (gpt-4o-mini дешевле и быстрее, но для сложных задач можно поставить gpt-4o)
+OPENAI_MODEL  = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 
 ai = OpenAI(api_key=OPENAI_KEY)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
@@ -70,6 +68,10 @@ SYSTEM_TRENDS = """Ты — аналитик beauty-трендов. Дай св�
   "summary": "2–3 предложения для контент-плана"
 }"""
 
+SYSTEM_CHAT = """Ты — умный и дружелюбный помощник владельца маникюрной студии. 
+Помогаешь с идеями, советуешь по работе, можешь просто поболтать. 
+Отвечай кратко и по делу."""
+
 # ── Генерация поста ───────────────────────────────────────────────────────────
 
 def get_season() -> str:
@@ -84,7 +86,7 @@ def generate_post(image_url: str, retrying: bool = False) -> str:
         else f"Вот фото работы. Сезон: {get_season()}. Напиши пост."
     )
     resp = ai.chat.completions.create(
-        model="gpt-4o",
+        model=OPENAI_MODEL,
         max_tokens=600,
         messages=[
             {"role": "system", "content": SYSTEM_POST},
@@ -102,7 +104,7 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Владелец прислал фото → генерируем черновик."""
     msg = update.message
     
-    # ПРОВЕРКА ДОСТУПА: только для владельца
+    # ПРОВЕРКА ДОСТУПА
     if msg.from_user.id != OWNER_CHAT_ID:
         await msg.reply_text("⛔ Извините, это приватный бот.")
         return
@@ -131,12 +133,39 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await msg.reply_text(f"📝 Черновик:\n\n{post_text}", reply_markup=keyboard)
 
 
+async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Общение с владельцем в текстовом режиме."""
+    msg = update.message
+    
+    # ПРОВЕРКА ДОСТУПА
+    if msg.from_user.id != OWNER_CHAT_ID:
+        return # Просто игнорируем чужие сообщения
+
+    await ctx.bot.send_chat_action(chat_id=msg.chat_id, action="typing")
+
+    try:
+        resp = ai.chat.completions.create(
+            model=OPENAI_MODEL,
+            max_tokens=500,
+            messages=[
+                {"role": "system", "content": SYSTEM_CHAT},
+                {"role": "user", "content": msg.text}
+            ],
+        )
+        answer = resp.choices[0].message.content.strip()
+        await msg.reply_text(answer)
+
+    except Exception as e:
+        log.error("OpenAI text error: %s", e)
+        await msg.reply_text("❌ Не удалось получить ответ. Попробуйте позже.")
+
+
 async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Нажата кнопка Опубликовать / Переписать."""
     query = update.callback_query
     await query.answer()
 
-    # ПРОВЕРКА ДОСТУПА: только для владельца
+    # ПРОВЕРКА ДОСТУПА
     if query.from_user.id != OWNER_CHAT_ID:
         await query.edit_message_text("⛔ У вас нет прав на это действие.")
         return
@@ -182,7 +211,7 @@ async def weekly_trends(app: Application):
     log.info("Running weekly trend analysis…")
     try:
         resp = ai.chat.completions.create(
-            model="gpt-4o-mini",
+            model=OPENAI_MODEL,
             max_tokens=400,
             response_format={"type": "json_object"},
             messages=[
@@ -216,7 +245,9 @@ def main():
         .build()
     )
 
+    # Обработчики
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(CallbackQueryHandler(handle_button))
 
     # Планировщик — тренды каждый понедельник в 9:00
@@ -228,7 +259,7 @@ def main():
     )
     scheduler.start()
 
-    log.info("Bot started. Waiting for photos…")
+    log.info("Bot started. Waiting for photos and messages…")
     
     # drop_pending_updates=True очищает старые сообщения при перезапуске
     app.run_polling(drop_pending_updates=True)
