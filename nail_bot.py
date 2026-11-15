@@ -197,7 +197,14 @@ async def weekly_trends(app: Application):
 # ── Запуск ────────────────────────────────────────────────────────────────────
 
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    # Добавляем увеличенные таймауты и разрешаем параллельную обработку
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .connect_timeout(30.0)
+        .read_timeout(30.0)
+        .build()
+    )
 
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(CallbackQueryHandler(handle_button))
@@ -212,7 +219,11 @@ def main():
     scheduler.start()
 
     log.info("Bot started. Waiting for photos…")
-    app.run_polling()
+    
+    # ВОТ ГЛАВНОЕ ИСПРАВЛЕНИЕ:
+    # drop_pending_updates=True удалит все старые "висящие" сообщения, 
+    # которые могли накопиться, пока бот падал или перезапускался.
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
