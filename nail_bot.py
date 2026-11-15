@@ -1,297 +1,128 @@
-"""
-Universal Content Bot
-===============
-Скиньте фото + текст (пожелание) → бот напишет пост → нажмите ✅ → опубликуется в канал.
-Можно писать текстом: "Напиши пост про..." — бот сгенерирует пост на тему.
-Можно просто общаться с ботом.
-Каждый понедельник в 9:00 — сводка трендов.
+"""BLIKI Telegram content bot — revised from the user's existing bot.
 
-Настройка (переменные окружения в Railway):
-  BOT_TOKEN     — токен от @BotFather
-  OPENAI_KEY    — ключ с platform.openai.com
-  CHANNEL_ID    — @username вашего канала или числовой ID
-  OWNER_CHAT_ID — ваш числовой ID (для доступа и рассылки)
-  OPENAI_MODEL  — (необязательно) модель, по умолчанию gpt-4o-mini
+Environment variables in Railway:
+  BOT_TOKEN, OPENAI_KEY, CHANNEL_ID, OWNER_CHAT_ID — required
+  OPENAI_MODEL — optional (default gpt-4o-mini)
+  DB_PATH — optional (default drafts.sqlite3; use Railway Volume for persistence)
+  BOOKING_URL — optional (real booking link; never fabricated)
+
+Requirements: python-telegram-bot>=21,<23 ; openai>=1,<3 ; APScheduler>=3.10,<4
+Start command: python bliki_bot_updated.py
 """
 
-import os, json, logging
+import asyncio
+import base64
+import io
+import json
+import logging
+import os
+import sqlite3
+import uuid
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application, MessageHandler, CallbackQueryHandler,
-    ContextTypes, filters
-)
-from openai import OpenAI
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from openai import AsyncOpenAI
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import Application, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 
-# ── Конфиг ────────────────────────────────────────────────────────────────────
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+OPENAI_KEY = os.environ["OPENAI_KEY"]
+CHANNEL_ID = os.environ["CHANNEL_ID"]
+OWNER_CHAT_ID = int(os.environ["OWNER_CHAT_ID"])
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+DB_PATH = os.getenv("DB_PATH", "drafts.sqlite3")
+BOOKING_URL = os.getenv("BOOKING_URL", "").strip()
+LOCAL_TZ = ZoneInfo("Asia/Yekaterinburg")
 
-BOT_TOKEN     = os.environ["BOT_TOKEN"]
-OPENAI_KEY    = os.environ["OPENAI_KEY"]
-CHANNEL_ID    = os.environ["CHANNEL_ID"]
-OWNER_CHAT_ID = int(os.environ.get("OWNER_CHAT_ID", "0"))
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("bliki")
+ai = AsyncOpenAI(api_key=OPENAI_KEY, timeout=60.0)
+publish_lock = asyncio.Lock()
 
-OPENAI_MODEL  = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+SYSTEM_POST = """Ты — редактор Telegram-канала студии маникюра BLIKI (Челябинск, Академ Riverside).
+Цель: показывать реальные работы мастеров, вызывать доверие и интерес к записи у местных клиенток.
 
-ai = OpenAI(api_key=OPENAI_KEY)
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
-log = logging.getLogger(__name__)
+Тон: дружелюбно, естественно, конкретно, без пафоса и навязчивых продаж.
+- Обычно 200–450 символов, иногда меньше. Длинный текст только при реальной информационной ценности.
+- Опирайся на видимые детали фото и проверенные сведения из задания. Не угадывай марку лака,
+  технологию покрытия, стойкость, стоимость, свободные даты и адрес.
+- Не превращай описание в художественное сочинение. Избегай «космической магии»,
+  «невероятной игры света», «этот маникюр — настоящее произведение искусства» и подобных клише.
+- Разнообразь начала и композицию; не вставляй вопрос или призыв в каждый пост.
+- Для обычной работы используй не более двух релевантных хештегов, включая при необходимости
+  #работыBLIKI. Не добавляй общие теги ради количества.
+- Смайлики — по желанию, не больше двух.
+- Уместно иногда напоминать о записи, но не делай это механически.
+- Не утверждай, что видишь содержание видео, если тебе дали только текстовое описание.
+- Возвращай только готовый текст поста, без пояснений и кавычек.
+"""
 
-drafts: dict = {}
+SYSTEM_TRENDS = """Ты помощник студии BLIKI. Предложи идеи сезонного контента о маникюре.
+ВАЖНО: у тебя нет доступа к интернету и свежей статистике; не называй это проверенными
+трендами текущей недели. Ответь JSON с ключами top_trend, trends (3), colors (3), summary."""
 
-# ── Промпты ───────────────────────────────────────────────────────────────────
+SYSTEM_CHAT = """Ты дружелюбный помощник владельца студии маникюра BLIKI.
+Отвечай кратко и по существу. Не выдумывай факты о студии."""
 
-# Обновленный системный промпт: теперь он универсальный
-SYSTEM_POST = """Ты — креативный контент-мейкер для Telegram-канала. Пишешь живо и по-человечески.
 
-Правила:
-1. ВСЕГДА следуй теме и пожеланиям владельца. Если есть фото — опиши его и свяжи с темой.
-2. Пиши так, как будто это пишет живой человек для своих подписчиков. Допускаются короткие рубленые фразы и легкая неформальность.
-3. КАТЕГОРИЧЕСКИ ИЗБЕГАЙ следующих признаков AI-текста:
-   - Раздувания значимости (фразы типа "играет ключевую роль", "является свидетельством", "оставляет след", "символизирует", "подчёркивает важность").
-   - Рекламных штампов ("уникальный", "инновационный", "в современном мире").
-   - Искусственных связок ("более того", "кроме того", "таким образом", "в заключение").
-   - Идеально ровных предложений. Чередуй длинные и короткие фразы.
-   - Конструкций "Это не просто X, это Y".
-4. Структура: цепляющее начало, основная мысль, живой вопрос или призыв к действию, 3-5 хэштегов.
-5. Длина: 600–900 символов. Emoji — умеренно (до 5 штук).
-6. Запрещено использовать клише: "нежный", "стильный", "элегантный", "трендовый".
-7. Пиши конкретно. Вместо "шикарный маникюр" напиши, почему он шикарный (цвет, форма, текстура)."""
+def now_local() -> datetime:
+    return datetime.now(LOCAL_TZ)
 
-SYSTEM_TRENDS = """Ты — аналитик beauty-трендов. Дай сводку актуальных трендов маникюра
-для небольшой студии. Опирайся на свои знания о сезонных и актуальных тенденциях.
 
-Ответь строго в формате JSON:
-{
-  "top_trend": "главный тренд одной фразой",
-  "trends": ["тренд 1", "тренд 2", "тренд 3"],
-  "colors": ["цвет 1", "цвет 2", "цвет 3"],
-  "summary": "2–3 предложения для контент-плана"
-}"""
+def season() -> str:
+    month = now_local().month
+    if month in (12, 1, 2):
+        return "зима"
+    if month in (3, 4, 5):
+        return "весна"
+    if month in (6, 7, 8):
+        return "лето"
+    return "осень"
 
-SYSTEM_CHAT = """Ты — умный и дружелюбный помощник владельца маникюрной студии. 
-Помогаешь с идеями, советуешь по работе, можешь просто поболтать. 
-Отвечай кратко и по делу."""
 
-# ── Генерация поста ───────────────────────────────────────────────────────────
+def db_connect():
+    connection = sqlite3.connect(DB_PATH, timeout=10)
+    connection.row_factory = sqlite3.Row
+    return connection
 
-def get_season() -> str:
-    m = datetime.now().month
-    return {12: "зима", 1: "зима", 2: "зима",
-             3: "весна", 4: "весна", 5: "весна",
-             6: "лето", 7: "лето", 8: "лето"}.get(m, "осень")
 
-def generate_post(image_url: str = None, user_caption: str = "", retrying: bool = False) -> str:
-    if retrying:
-        user_text = f"Перепиши пост иначе, сохранив смысл. Тема/пожелание: {user_caption}"
-    else:
-        if image_url and user_caption:
-            user_text = (
-                f"Вот фото. Владелец просит написать пост на тему: '{user_caption}'.\n"
-                f"Посмотри на фото, но напиши именно то, что просит владелец. "
-                f"Сезон: {get_season()}."
-            )
-        elif image_url:
-            user_text = f"Вот фото работы. Сезон: {get_season()}. Напиши пост, описывая то, что видишь."
-        else:
-            user_text = f"Напиши пост на тему: '{user_caption}'. Сезон: {get_season()}."
+def init_db():
+    with db_connect() as connection:
+        connection.execute("""CREATE TABLE IF NOT EXISTS drafts (
+            id TEXT PRIMARY KEY, owner_id INTEGER NOT NULL, text TEXT NOT NULL,
+            source_caption TEXT NOT NULL, media_type TEXT, file_id TEXT,
+            status TEXT NOT NULL DEFAULT 'pending'
+        )""")
 
-    content = [{"type": "text", "text": user_text}]
-    if image_url:
-        content.append({"type": "image_url", "image_url": {"url": image_url}})
 
-    resp = ai.chat.completions.create(
-        model=OPENAI_MODEL,
-        max_tokens=700, # Чуть увеличили, чтобы модель успевала описать и фото, и тему
-        messages=[
-            {"role": "system", "content": SYSTEM_POST},
-            {"role": "user", "content": content},
-        ],
-    )
-    return resp.choices[0].message.content.strip()
+def save_draft(text: str, source_caption: str = "", media_type=None, file_id=None) -> str:
+    draft_id = uuid.uuid4().hex[:16]
+    with db_connect() as connection:
+        connection.execute(
+            "INSERT INTO drafts(id,owner_id,text,source_caption,media_type,file_id) VALUES(?,?,?,?,?,?)",
+            (draft_id, OWNER_CHAT_ID, text, source_caption, media_type, file_id),
+        )
+    return draft_id
 
-# ── Обработчики Telegram ──────────────────────────────────────────────────────
 
-async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    
-    if msg.from_user.id != OWNER_CHAT_ID:
-        await msg.reply_text("⛔ Извините, это приватный бот.")
-        return
+def get_draft(draft_id: str):
+    with db_connect() as connection:
+        return connection.execute("SELECT * FROM drafts WHERE id=?", (draft_id,)).fetchone()
 
-    chat_id = msg.chat_id
-    user_caption = msg.caption if msg.caption else ""
-    
-    await msg.reply_text("⏳ Пишу пост…")
 
-    file = await ctx.bot.get_file(msg.photo[-1].file_id)
-    image_url = file.file_path
+def update_draft(draft_id: str, text: str):
+    with db_connect() as connection:
+        connection.execute("UPDATE drafts SET text=? WHERE id=? AND status='pending'", (text, draft_id))
 
-    try:
-        post_text = generate_post(image_url=image_url, user_caption=user_caption)
-    except Exception as e:
-        log.error("OpenAI error: %s", e)
-        await msg.reply_text("❌ Не удалось сгенерировать пост. Попробуйте ещё раз.")
-        return
 
-    drafts[chat_id] = {"text": post_text, "file_id": msg.photo[-1].file_id, "caption": user_caption}
+def mark_published(draft_id: str):
+    with db_connect() as connection:
+        connection.execute("UPDATE drafts SET status='published' WHERE id=?", (draft_id,))
 
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Опубликовать", callback_data="approve"),
-        InlineKeyboardButton("🔄 Переписать",   callback_data="retry"),
+
+def buttons(draft_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Опубликовать", callback_data=f"approve:{draft_id}"),
+        InlineKeyboardButton("🔄 Переписать", callback_data=f"retry:{draft_id}"),
     ]])
-    await msg.reply_text(f"📝 Черновик:\n\n{post_text}", reply_markup=keyboard)
-
-
-async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    
-    if msg.from_user.id != OWNER_CHAT_ID:
-        return
-
-    user_text = msg.text.strip()
-    
-    triggers = ["напиши пост", "сделай пост", "пост на тему", "сгенерируй пост"]
-    is_post_request = any(user_text.lower().startswith(trigger) for trigger in triggers)
-
-    await ctx.bot.send_chat_action(chat_id=msg.chat_id, action="typing")
-
-    try:
-        if is_post_request:
-            post_text = generate_post(user_caption=user_text)
-            chat_id = msg.chat_id
-            drafts[chat_id] = {"text": post_text, "file_id": None, "caption": user_text}
-
-            keyboard = InlineKeyboardMarkup([[
-                InlineKeyboardButton("✅ Опубликовать", callback_data="approve"),
-                InlineKeyboardButton("🔄 Переписать",   callback_data="retry"),
-            ]])
-            await msg.reply_text(f"📝 Черновик:\n\n{post_text}", reply_markup=keyboard)
-            
-        else:
-            resp = ai.chat.completions.create(
-                model=OPENAI_MODEL,
-                max_tokens=500,
-                messages=[
-                    {"role": "system", "content": SYSTEM_CHAT},
-                    {"role": "user", "content": user_text}
-                ],
-            )
-            answer = resp.choices[0].message.content.strip()
-            await msg.reply_text(answer)
-
-    except Exception as e:
-        log.error("OpenAI text error: %s", e)
-        await msg.reply_text("❌ Произошла ошибка. Попробуйте позже.")
-
-
-async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    if query.from_user.id != OWNER_CHAT_ID:
-        await query.edit_message_text("⛔ У вас нет прав на это действие.")
-        return
-
-    chat_id = query.message.chat_id
-    draft = drafts.get(chat_id)
-
-    if not draft:
-        await query.edit_message_text("⚠️ Черновик не найден. Пришлите фото заново.")
-        return
-
-    if query.data == "approve":
-        if draft["file_id"]:
-            await ctx.bot.send_photo(
-                chat_id=CHANNEL_ID,
-                photo=draft["file_id"],
-                caption=draft["text"],
-            )
-        else:
-            await ctx.bot.send_message(
-                chat_id=CHANNEL_ID,
-                text=draft["text"],
-            )
-        await query.edit_message_text("✅ Опубликовано в канале!")
-        drafts.pop(chat_id, None)
-
-    elif query.data == "retry":
-        await query.edit_message_text("⏳ Переписываю…")
-        file_path = None
-        if draft["file_id"]:
-            file = await ctx.bot.get_file(draft["file_id"])
-            file_path = file.file_path
-            
-        try:
-            new_text = generate_post(image_url=file_path, user_caption=draft.get("caption", ""), retrying=True)
-        except Exception as e:
-            log.error("OpenAI retry error: %s", e)
-            await query.edit_message_text("❌ Ошибка. Попробуйте ещё раз.")
-            return
-
-        draft["text"] = new_text
-        keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Опубликовать", callback_data="approve"),
-            InlineKeyboardButton("🔄 Переписать",   callback_data="retry"),
-        ]])
-        await query.edit_message_text(f"📝 Новый вариант:\n\n{new_text}", reply_markup=keyboard)
-
-# ── Еженедельный анализ трендов ───────────────────────────────────────────────
-
-async def weekly_trends(app: Application):
-    log.info("Running weekly trend analysis…")
-    try:
-        resp = ai.chat.completions.create(
-            model=OPENAI_MODEL,
-            max_tokens=400,
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": SYSTEM_TRENDS},
-                {"role": "user",   "content": f"Дата: {datetime.now().strftime('%d.%m.%Y')}. Сезон: {get_season()}."},
-            ],
-        )
-        data = json.loads(resp.choices[0].message.content)
-        text = (
-            "📊 Тренды недели\n\n"
-            f"🔥 Главный: {data.get('top_trend','—')}\n\n"
-            f"Тренды: {', '.join(data.get('trends', []))}\n"
-            f"Цвета: {', '.join(data.get('colors', []))}\n\n"
-            f"💡 {data.get('summary','')}"
-        )
-        
-        if OWNER_CHAT_ID:
-            await app.bot.send_message(chat_id=OWNER_CHAT_ID, text=text)
-        log.info("Trends sent: %s", data.get("top_trend"))
-    except Exception as e:
-        log.error("Trends error: %s", e)
-
-# ── Запуск ────────────────────────────────────────────────────────────────────
-
-def main():
-    app = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .connect_timeout(30.0)
-        .read_timeout(30.0)
-        .build()
-    )
-
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    app.add_handler(CallbackQueryHandler(handle_button))
-
-    scheduler = AsyncIOScheduler()
-    scheduler.add_job(
-        weekly_trends, "cron",
-        day_of_week="mon", hour=9, minute=0,
-        args=[app],
-    )
-    scheduler.start()
-
-    log.info("Bot started. Waiting for photos and messages…")
-    
-    app.run_polling(drop_pending_updates=True)
-
-if __name__ == "__main__":
-    main()
