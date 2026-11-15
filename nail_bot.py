@@ -1,7 +1,9 @@
 """
 Nail Studio Bot
 ===============
-Скиньте фото работы → бот напишет пост → нажмите ✅ → опубликуется в канал.
+Скиньте фото работы (с текстом или без) → бот напишет пост → нажмите ✅ → опубликуется в канал.
+Можно писать текстом: "Напиши пост про..." — бот сгенерирует пост на тему.
+Можно просто общаться с ботом.
 Каждый понедельник в 9:00 — сводка трендов.
 
 Настройка (переменные окружения в Railway):
@@ -9,7 +11,7 @@ Nail Studio Bot
   OPENAI_KEY    — ключ с platform.openai.com
   CHANNEL_ID    — @username вашего канала или числовой ID
   OWNER_CHAT_ID — ваш числовой ID (для доступа и рассылки)
-  OPENAI_MODEL  — (необязательно) название модели, по умолчанию gpt-4o-mini
+  OPENAI_MODEL  — (необязательно) модель, по умолчанию gpt-4o-mini
 """
 
 import os, json, logging
@@ -27,17 +29,16 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 BOT_TOKEN     = os.environ["BOT_TOKEN"]
 OPENAI_KEY    = os.environ["OPENAI_KEY"]
-CHANNEL_ID    = os.environ["CHANNEL_ID"]   # @yourchannel или -1001234567890
+CHANNEL_ID    = os.environ["CHANNEL_ID"]
 OWNER_CHAT_ID = int(os.environ.get("OWNER_CHAT_ID", "0"))
 
-# Модель по умолчанию (gpt-4o-mini дешевле и быстрее, но для сложных задач можно поставить gpt-4o)
 OPENAI_MODEL  = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 
 ai = OpenAI(api_key=OPENAI_KEY)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger(__name__)
 
-# Храним черновик в памяти: { chat_id: { "text": ..., "file_id": ... } }
+# Храним черновик в памяти: { chat_id: { "text": ..., "file_id": ..., "caption": ... } }
 drafts: dict = {}
 
 # ── Промпты ───────────────────────────────────────────────────────────────────
@@ -80,20 +81,28 @@ def get_season() -> str:
              3: "весна", 4: "весна", 5: "весна",
              6: "лето", 7: "лето", 8: "лето"}.get(m, "осень")
 
-def generate_post(image_url: str, retrying: bool = False) -> str:
-    user_text = (
-        "Перепиши пост иначе — другой угол подачи, другое начало." if retrying
-        else f"Вот фото работы. Сезон: {get_season()}. Напиши пост."
-    )
+def generate_post(image_url: str = None, user_caption: str = "", retrying: bool = False) -> str:
+    if retrying:
+        user_text = "Перепиши пост иначе — другой угол подачи, другое начало."
+    else:
+        if image_url:
+            user_text = f"Вот фото работы. Сезон: {get_season()}. Напиши пост."
+        else:
+            user_text = f"Напиши пост на тему: {user_caption}. Сезон: {get_season()}."
+            
+        if user_caption and image_url:
+            user_text += f"\n\nОБЯЗАТЕЛЬНО учти пожелание владельца студии: {user_caption}"
+
+    content = [{"type": "text", "text": user_text}]
+    if image_url:
+        content.append({"type": "image_url", "image_url": {"url": image_url}})
+
     resp = ai.chat.completions.create(
         model=OPENAI_MODEL,
         max_tokens=600,
         messages=[
             {"role": "system", "content": SYSTEM_POST},
-            {"role": "user", "content": [
-                {"type": "text",      "text": user_text},
-                {"type": "image_url", "image_url": {"url": image_url}},
-            ]},
+            {"role": "user", "content": content},
         ],
     )
     return resp.choices[0].message.content.strip()
@@ -101,30 +110,29 @@ def generate_post(image_url: str, retrying: bool = False) -> str:
 # ── Обработчики Telegram ──────────────────────────────────────────────────────
 
 async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Владелец прислал фото → генерируем черновик."""
+    """Владелец прислал фото (возможно с текстом) → генерируем черновик."""
     msg = update.message
     
-    # ПРОВЕРКА ДОСТУПА
     if msg.from_user.id != OWNER_CHAT_ID:
         await msg.reply_text("⛔ Извините, это приватный бот.")
         return
 
     chat_id = msg.chat_id
+    user_caption = msg.caption if msg.caption else ""
+    
     await msg.reply_text("⏳ Пишу пост…")
 
-    # Берём самое большое фото
     file = await ctx.bot.get_file(msg.photo[-1].file_id)
-    image_url = file.file_path          # прямая ссылка на файл
+    image_url = file.file_path
 
     try:
-        post_text = generate_post(image_url)
+        post_text = generate_post(image_url=image_url, user_caption=user_caption)
     except Exception as e:
         log.error("OpenAI error: %s", e)
         await msg.reply_text("❌ Не удалось сгенерировать пост. Попробуйте ещё раз.")
         return
 
-    # Сохраняем черновик
-    drafts[chat_id] = {"text": post_text, "file_id": msg.photo[-1].file_id}
+    drafts[chat_id] = {"text": post_text, "file_id": msg.photo[-1].file_id, "caption": user_caption}
 
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ Опубликовать", callback_data="approve"),
@@ -134,30 +142,47 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Общение с владельцем в текстовом режиме."""
+    """Общение с владельцем или генерация поста по текстовой теме."""
     msg = update.message
     
-    # ПРОВЕРКА ДОСТУПА
     if msg.from_user.id != OWNER_CHAT_ID:
-        return # Просто игнорируем чужие сообщения
+        return
+
+    user_text = msg.text.strip()
+    
+    # Триггеры для генерации поста
+    triggers = ["напиши пост", "сделай пост", "пост на тему", "сгенерируй пост"]
+    is_post_request = any(user_text.lower().startswith(trigger) for trigger in triggers)
 
     await ctx.bot.send_chat_action(chat_id=msg.chat_id, action="typing")
 
     try:
-        resp = ai.chat.completions.create(
-            model=OPENAI_MODEL,
-            max_tokens=500,
-            messages=[
-                {"role": "system", "content": SYSTEM_CHAT},
-                {"role": "user", "content": msg.text}
-            ],
-        )
-        answer = resp.choices[0].message.content.strip()
-        await msg.reply_text(answer)
+        if is_post_request:
+            post_text = generate_post(user_caption=user_text)
+            chat_id = msg.chat_id
+            drafts[chat_id] = {"text": post_text, "file_id": None, "caption": user_text}
+
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Опубликовать", callback_data="approve"),
+                InlineKeyboardButton("🔄 Переписать",   callback_data="retry"),
+            ]])
+            await msg.reply_text(f"📝 Черновик:\n\n{post_text}", reply_markup=keyboard)
+            
+        else:
+            resp = ai.chat.completions.create(
+                model=OPENAI_MODEL,
+                max_tokens=500,
+                messages=[
+                    {"role": "system", "content": SYSTEM_CHAT},
+                    {"role": "user", "content": user_text}
+                ],
+            )
+            answer = resp.choices[0].message.content.strip()
+            await msg.reply_text(answer)
 
     except Exception as e:
         log.error("OpenAI text error: %s", e)
-        await msg.reply_text("❌ Не удалось получить ответ. Попробуйте позже.")
+        await msg.reply_text("❌ Произошла ошибка. Попробуйте позже.")
 
 
 async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -165,7 +190,6 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    # ПРОВЕРКА ДОСТУПА
     if query.from_user.id != OWNER_CHAT_ID:
         await query.edit_message_text("⛔ У вас нет прав на это действие.")
         return
@@ -178,20 +202,29 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if query.data == "approve":
-        # Публикуем фото с подписью в канал
-        await ctx.bot.send_photo(
-            chat_id=CHANNEL_ID,
-            photo=draft["file_id"],
-            caption=draft["text"],
-        )
+        if draft["file_id"]:
+            await ctx.bot.send_photo(
+                chat_id=CHANNEL_ID,
+                photo=draft["file_id"],
+                caption=draft["text"],
+            )
+        else:
+            await ctx.bot.send_message(
+                chat_id=CHANNEL_ID,
+                text=draft["text"],
+            )
         await query.edit_message_text("✅ Опубликовано в канале!")
         drafts.pop(chat_id, None)
 
     elif query.data == "retry":
         await query.edit_message_text("⏳ Переписываю…")
-        file = await ctx.bot.get_file(draft["file_id"])
+        file_path = None
+        if draft["file_id"]:
+            file = await ctx.bot.get_file(draft["file_id"])
+            file_path = file.file_path
+            
         try:
-            new_text = generate_post(file.file_path, retrying=True)
+            new_text = generate_post(image_url=file_path, user_caption=draft.get("caption", ""), retrying=True)
         except Exception as e:
             log.error("OpenAI retry error: %s", e)
             await query.edit_message_text("❌ Ошибка. Попробуйте ещё раз.")
@@ -245,12 +278,10 @@ def main():
         .build()
     )
 
-    # Обработчики
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(CallbackQueryHandler(handle_button))
 
-    # Планировщик — тренды каждый понедельник в 9:00
     scheduler = AsyncIOScheduler()
     scheduler.add_job(
         weekly_trends, "cron",
@@ -261,7 +292,6 @@ def main():
 
     log.info("Bot started. Waiting for photos and messages…")
     
-    # drop_pending_updates=True очищает старые сообщения при перезапуске
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
