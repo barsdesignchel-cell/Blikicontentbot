@@ -1,7 +1,7 @@
 """
-Nail Studio Bot
+Universal Content Bot
 ===============
-Скиньте фото работы (с текстом или без) → бот напишет пост → нажмите ✅ → опубликуется в канал.
+Скиньте фото + текст (пожелание) → бот напишет пост → нажмите ✅ → опубликуется в канал.
 Можно писать текстом: "Напиши пост про..." — бот сгенерирует пост на тему.
 Можно просто общаться с ботом.
 Каждый понедельник в 9:00 — сводка трендов.
@@ -38,25 +38,22 @@ ai = OpenAI(api_key=OPENAI_KEY)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger(__name__)
 
-# Храним черновик в памяти: { chat_id: { "text": ..., "file_id": ..., "caption": ... } }
 drafts: dict = {}
 
 # ── Промпты ───────────────────────────────────────────────────────────────────
 
-SYSTEM_POST = """Ты — контент-менеджер маникюрной студии. Пишешь посты для Telegram-канала.
+# Обновленный системный промпт: теперь он универсальный
+SYSTEM_POST = """Ты — креативный контент-мейкер для Telegram-канала. 
+Твоя задача — писать вовлекающие посты.
 
-Аудитория: женщины 20–45 лет. Стиль: демократично, но с характером — не пафосно, не занудно.
-Как умная подруга, которая разбирается в маникюре.
-
-Структура поста:
-1. Первая строка — цепляющая фраза (без клише "идеальный маникюр", "нежный образ")
-2. 2–3 предложения о работе: что сделано, какое настроение, чем интересно
-3. Практичная деталь: покрытие, стойкость или повод — одна конкретная вещь
-4. Призыв к действию: короткий, не агрессивный
-5. 5–7 хэштегов (микс популярных и нишевых)
-
-Запрещено: слова "нежный", "стильный", "элегантный", "трендовый".
-Emoji — не больше 3 штук. Длина: 600–900 символов."""
+Правила:
+1. ВСЕГДА следуй теме и пожеланиям, которые дает владелец канала в тексте.
+2. Если к сообщению прикреплено фото, внимательно посмотри на него. Опиши то, что на нем, и свяжи это с темой поста. (Например: если на фото улыбающийся мастер, а тема "хорошей рабочей недели", напиши про позитивный настрой мастера и пожелай хорошей недели).
+3. Если на фото маникюр, опиши его. Если на фото что-то другое (интерьер, кофе, человек), используй это как визуальный фон для твоего текста.
+4. Структура: цепляющее начало, основная мысль, призыв к действию (или вопрос), 3-5 хэштегов.
+5. Длина: 600–900 символов. Emoji — умеренно (до 5 штук).
+6. Запрещено использовать клише: "нежный", "стильный", "элегантный", "трендовый".
+7. Пиши живым, дружелюбным языком, как будто общаешься с подписчиками."""
 
 SYSTEM_TRENDS = """Ты — аналитик beauty-трендов. Дай сводку актуальных трендов маникюра
 для небольшой студии. Опирайся на свои знания о сезонных и актуальных тенденциях.
@@ -83,15 +80,18 @@ def get_season() -> str:
 
 def generate_post(image_url: str = None, user_caption: str = "", retrying: bool = False) -> str:
     if retrying:
-        user_text = "Перепиши пост иначе — другой угол подачи, другое начало."
+        user_text = f"Перепиши пост иначе, сохранив смысл. Тема/пожелание: {user_caption}"
     else:
-        if image_url:
-            user_text = f"Вот фото работы. Сезон: {get_season()}. Напиши пост."
+        if image_url and user_caption:
+            user_text = (
+                f"Вот фото. Владелец просит написать пост на тему: '{user_caption}'.\n"
+                f"Посмотри на фото, но напиши именно то, что просит владелец. "
+                f"Сезон: {get_season()}."
+            )
+        elif image_url:
+            user_text = f"Вот фото работы. Сезон: {get_season()}. Напиши пост, описывая то, что видишь."
         else:
-            user_text = f"Напиши пост на тему: {user_caption}. Сезон: {get_season()}."
-            
-        if user_caption and image_url:
-            user_text += f"\n\nОБЯЗАТЕЛЬНО учти пожелание владельца студии: {user_caption}"
+            user_text = f"Напиши пост на тему: '{user_caption}'. Сезон: {get_season()}."
 
     content = [{"type": "text", "text": user_text}]
     if image_url:
@@ -99,7 +99,7 @@ def generate_post(image_url: str = None, user_caption: str = "", retrying: bool 
 
     resp = ai.chat.completions.create(
         model=OPENAI_MODEL,
-        max_tokens=600,
+        max_tokens=700, # Чуть увеличили, чтобы модель успевала описать и фото, и тему
         messages=[
             {"role": "system", "content": SYSTEM_POST},
             {"role": "user", "content": content},
@@ -110,7 +110,6 @@ def generate_post(image_url: str = None, user_caption: str = "", retrying: bool 
 # ── Обработчики Telegram ──────────────────────────────────────────────────────
 
 async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Владелец прислал фото (возможно с текстом) → генерируем черновик."""
     msg = update.message
     
     if msg.from_user.id != OWNER_CHAT_ID:
@@ -142,7 +141,6 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Общение с владельцем или генерация поста по текстовой теме."""
     msg = update.message
     
     if msg.from_user.id != OWNER_CHAT_ID:
@@ -150,7 +148,6 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     user_text = msg.text.strip()
     
-    # Триггеры для генерации поста
     triggers = ["напиши пост", "сделай пост", "пост на тему", "сгенерируй пост"]
     is_post_request = any(user_text.lower().startswith(trigger) for trigger in triggers)
 
@@ -186,7 +183,6 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Нажата кнопка Опубликовать / Переписать."""
     query = update.callback_query
     await query.answer()
 
@@ -240,7 +236,6 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ── Еженедельный анализ трендов ───────────────────────────────────────────────
 
 async def weekly_trends(app: Application):
-    """Запускается каждый понедельник в 9:00."""
     log.info("Running weekly trend analysis…")
     try:
         resp = ai.chat.completions.create(
