@@ -8,10 +8,11 @@ Nail Studio Bot
   BOT_TOKEN   — токен от @BotFather
   OPENAI_KEY  — ключ с platform.openai.com
   CHANNEL_ID  — @username вашего канала или числовой ID
+  OWNER_CHAT_ID — ваш числовой ID (для доступа и рассылки)
 
 Запуск локально:
   pip install python-telegram-bot openai apscheduler
-  BOT_TOKEN=... OPENAI_KEY=... CHANNEL_ID=... python nail_bot.py
+  BOT_TOKEN=... OPENAI_KEY=... CHANNEL_ID=... OWNER_CHAT_ID=... python nail_bot.py
 
 Деплой на Railway: просто залейте файл, добавьте переменные в Settings → Variables.
 """
@@ -29,9 +30,10 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # ── Конфиг ────────────────────────────────────────────────────────────────────
 
-BOT_TOKEN  = os.environ["BOT_TOKEN"]
-OPENAI_KEY = os.environ["OPENAI_KEY"]
-CHANNEL_ID = os.environ["CHANNEL_ID"]   # @yourchannel или -1001234567890
+BOT_TOKEN     = os.environ["BOT_TOKEN"]
+OPENAI_KEY    = os.environ["OPENAI_KEY"]
+CHANNEL_ID    = os.environ["CHANNEL_ID"]   # @yourchannel или -1001234567890
+OWNER_CHAT_ID = int(os.environ.get("OWNER_CHAT_ID", "0"))
 
 ai = OpenAI(api_key=OPENAI_KEY)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
@@ -99,8 +101,13 @@ def generate_post(image_url: str, retrying: bool = False) -> str:
 async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Владелец прислал фото → генерируем черновик."""
     msg = update.message
-    chat_id = msg.chat_id
+    
+    # ПРОВЕРКА ДОСТУПА: только для владельца
+    if msg.from_user.id != OWNER_CHAT_ID:
+        await msg.reply_text("⛔ Извините, это приватный бот.")
+        return
 
+    chat_id = msg.chat_id
     await msg.reply_text("⏳ Пишу пост…")
 
     # Берём самое большое фото
@@ -128,6 +135,12 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Нажата кнопка Опубликовать / Переписать."""
     query = update.callback_query
     await query.answer()
+
+    # ПРОВЕРКА ДОСТУПА: только для владельца
+    if query.from_user.id != OWNER_CHAT_ID:
+        await query.edit_message_text("⛔ У вас нет прав на это действие.")
+        return
+
     chat_id = query.message.chat_id
     draft = drafts.get(chat_id)
 
@@ -185,11 +198,9 @@ async def weekly_trends(app: Application):
             f"Цвета: {', '.join(data.get('colors', []))}\n\n"
             f"💡 {data.get('summary','')}"
         )
-        # Находим chat_id владельца — шлём в первый активный чат из drafts
-        # Или замените OWNER_CHAT_ID на ваш числовой ID
-        owner_id = int(os.environ.get("OWNER_CHAT_ID", "0"))
-        if owner_id:
-            await app.bot.send_message(chat_id=owner_id, text=text)
+        
+        if OWNER_CHAT_ID:
+            await app.bot.send_message(chat_id=OWNER_CHAT_ID, text=text)
         log.info("Trends sent: %s", data.get("top_trend"))
     except Exception as e:
         log.error("Trends error: %s", e)
@@ -197,7 +208,6 @@ async def weekly_trends(app: Application):
 # ── Запуск ────────────────────────────────────────────────────────────────────
 
 def main():
-    # Добавляем увеличенные таймауты и разрешаем параллельную обработку
     app = (
         Application.builder()
         .token(BOT_TOKEN)
@@ -220,9 +230,7 @@ def main():
 
     log.info("Bot started. Waiting for photos…")
     
-    # ВОТ ГЛАВНОЕ ИСПРАВЛЕНИЕ:
-    # drop_pending_updates=True удалит все старые "висящие" сообщения, 
-    # которые могли накопиться, пока бот падал или перезапускался.
+    # drop_pending_updates=True очищает старые сообщения при перезапуске
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
