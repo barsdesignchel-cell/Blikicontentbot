@@ -92,6 +92,16 @@ def init_db():
             id TEXT PRIMARY KEY, owner_id INTEGER NOT NULL, mode TEXT NOT NULL,
             created_at TEXT NOT NULL, payload TEXT NOT NULL
         )""")
+        db.execute("""CREATE TABLE IF NOT EXISTS idea_reviews (
+            research_id TEXT NOT NULL, idea_index INTEGER NOT NULL,
+            owner_id INTEGER NOT NULL, decision TEXT NOT NULL,
+            PRIMARY KEY (research_id, idea_index, owner_id)
+        )""")
+        db.execute("""CREATE TABLE IF NOT EXISTS blix_concepts (
+            id TEXT PRIMARY KEY, owner_id INTEGER NOT NULL, text TEXT NOT NULL,
+            scene TEXT NOT NULL, visual_prompt TEXT NOT NULL,
+            source_caption TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending'
+        )""")
 
 
 def save_draft(text, source_caption="", media_type=None, file_id=None):
@@ -122,6 +132,7 @@ def buttons(draft_id):
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ Опубликовать", callback_data=f"approve:{draft_id}"),
         InlineKeyboardButton("🔄 Переписать", callback_data=f"retry:{draft_id}"),
+        InlineKeyboardButton("❌ Отклонить", callback_data=f"reject:{draft_id}"),
     ]])
 
 
@@ -266,8 +277,8 @@ SYSTEM_RESEARCH = """Ты контент-стратег студии маник�
 Не называй дизайн доказанно вирусным: доступные веб-выдержки не подтверждают статистику
 просмотров/сохранений/скорость роста популярности. Не выдумывай метрики или даты.
 Для каждого: название, объяснение по источнику, идея короткого видео со съёмкой в студии,
-идея поста, цепляющее начало, необязательная лаконичная реплика Бликса (кот-сфинкс,
-самопровозглашённый директор BLIKI). Не утверждай, что работа уже выполнена в студии.
+идея поста, цепляющее начало. НЕ УПОМИНАЙ Бликса, котов или персонажей: это аналитический отчёт
+для контент-менеджера, а не публикация. Не утверждай, что работа уже выполнена в студии.
 
 Оцени ТОЛЬКО два практических аспекта. Каждый критерий — целое число от 0 до 5:
 fit: local (насколько уместен для обычной аудитории небольшой районной студии),
@@ -280,7 +291,7 @@ shoot (можно ли снять на смартфон без сложной т
 
 Верни ТОЛЬКО JSON вида:
 {"ideas":[{"title":"...","why":"...","video":"...","post":"...",
-"hook":"...","blix":"...","source_ids":[1,2],
+"hook":"...","source_ids":[1,2],
 "fit":{"local":3,"season":3,"feasibility":3,"versatility":3},
 "video_fit":{"visual":3,"hook":3,"shoot":3,"distinct":3},
 "score_reason":"..."}]}.
@@ -345,7 +356,7 @@ async def analyze_sources(mode, sources):
         if not ids:
             continue  # Don't show unsourced ideas as sourced research.
         scores = score_idea(item)
-        ideas.append({k: str(item.get(k, ""))[:600] for k in ("title", "why", "video", "post", "hook", "blix")}
+        ideas.append({k: str(item.get(k, ""))[:600] for k in ("title", "why", "video", "post", "hook")}
                      | {"sources": [sources[i-1] for i in ids[:2]],
                         "score_reason": str(item.get("score_reason", ""))[:350], **scores})
     if not ideas:
@@ -382,11 +393,11 @@ async def send_research(chat_id, bot, mode):
                        f"Почему интересна идея: {item['why']}\n\n"
                        f"🎥 Видео: {item['video']}\n"
                        f"📝 Пост: {item['post']}\n"
-                       f"🎯 Хук: {item['hook']}\n"
-                       f"🐈 Бликс: {item['blix']}\n\n"
+                       f"🎯 Хук: {item['hook']}\n\n"
                        f"Источники:\n{urls}")
             keyboard = InlineKeyboardMarkup([[
-                InlineKeyboardButton("✍️ Создать пост", callback_data=f"idea:{research_id}:{idx}")
+                InlineKeyboardButton("✅ Утвердить идею", callback_data=f"pick:{research_id}:{idx}"),
+                InlineKeyboardButton("❌ Отклонить", callback_data=f"drop:{research_id}:{idx}")
             ]])
             await bot.send_message(chat_id=chat_id, text=message[:4000], reply_markup=keyboard,
                                    disable_web_page_preview=True)
@@ -400,6 +411,93 @@ async def send_research(chat_id, bot, mode):
         await bot.send_message(chat_id=chat_id, text="❌ Не удалось проверить источники. Посмотри логи Railway или попробуй позже.")
 
 
+# BLIKS / BLIKI: canonical approved brand character, not a random new cat each time.
+BLIX_CANON = """Бликс — маленький взрослый кот-сфинкс РЕАЛЬНОГО кошачьего размера
+(примерно 35–40 см в холке), худощавый, с тёплой серо-розовой кожей, крупными ушами,
+аристократической мордой и высокомерным выразительным прищуром. Он самоназначенный
+генеральный директор студии BLIKI: язвительный, сноб, комедийно самовлюблённый,
+но не злой. Слоган: «Я не лысый. Я минималистичный». Никаких оскорблений клиенток
+и мастеров. Он живёт В НАСТОЯЩЕМ интерьере BLIKI, педикюрное кресло — его трон.
+Не изображай его человеком и не увеличивай до человеческого роста.
+Постоянный визуальный образ можно считать только текстовым ориентиром, пока
+не утверждены и не загружены эталонные изображения персонажа и интерьера."""
+
+SYSTEM_BLIX_CONCEPT = """Ты сценарист мини-сериала про Бликса, фирменного персонажа BLIKI.
+Создай оригинальную сценку по найденной идее маникюра, не штампованную шутку.
+Покажи персонажа в интерьере РЕАЛЬНОЙ студии, но не выдумывай конкретный вид помещения:
+если фото места не приложено, дай условную сцену и отметь, что визуал требует фото BLIKI.
+Характер и внешний вид строго по паспорту:
+""" + BLIX_CANON + """
+Сценка должна быть связана с маникюром, а не случайной репликой.
+Не утверждай, что маникюр уже выполнен. Не создавай изображение, только описание.
+Верни ТОЛЬКО JSON с полями scene (что происходит, 1–3 предложения),
+post (короткий, смешной пост для клиента, без заголовка «Бликс:»),
+visual_prompt (конкретная сцена для будущего монтажа в фотографию студии,
+реалистичный кошачий размер, без выдуманного интерьера)."""
+
+
+def review_idea(rid, idx, decision):
+    with connect_db() as db:
+        db.execute("""INSERT INTO idea_reviews(research_id,idea_index,owner_id,decision)
+                   VALUES(?,?,?,?) ON CONFLICT(research_id,idea_index,owner_id)
+                   DO UPDATE SET decision=excluded.decision""", (rid, idx, OWNER_CHAT_ID, decision))
+
+
+def idea_review(rid, idx):
+    with connect_db() as db:
+        row = db.execute("SELECT decision FROM idea_reviews WHERE research_id=? AND idea_index=? AND owner_id=?",
+                         (rid, idx, OWNER_CHAT_ID)).fetchone()
+    return row["decision"] if row else None
+
+
+def save_blix_concept(item, caption):
+    cid = uuid.uuid4().hex[:16]
+    with connect_db() as db:
+        db.execute("INSERT INTO blix_concepts(id,owner_id,text,scene,visual_prompt,source_caption) VALUES(?,?,?,?,?,?)",
+                   (cid, OWNER_CHAT_ID, item["post"], item["scene"], item["visual_prompt"], caption))
+    return cid
+
+
+def read_blix_concept(cid):
+    with connect_db() as db:
+        row = db.execute("SELECT * FROM blix_concepts WHERE id=? AND owner_id=?", (cid, OWNER_CHAT_ID)).fetchone()
+    return dict(row) if row else None
+
+
+async def create_normal_post(chat_id, bot, idea):
+    caption = (f"Напиши пост-приглашение обсудить идею дизайна: {idea['title']}. "
+               f"Тема: {idea['post']}. Хук: {idea['hook']}. "
+               "Это концепт будущей работы, а не готовый маникюр. "
+               "Не выдумывай выполненную работу, цены, слоты. Не упоминай Бликса.")
+    result = await ai_post(caption=caption)
+    if not result:
+        raise ValueError("Пустой текст")
+    await show_draft_from_chat(chat_id, bot, result, caption)
+
+
+async def create_blix_concept(chat_id, bot, idea):
+    prompt = json.dumps({k: idea.get(k) for k in ("title", "why", "video", "post", "hook")}, ensure_ascii=False)
+    response = await ai.chat.completions.create(
+        model=OPENAI_MODEL, max_tokens=1100, response_format={"type": "json_object"},
+        messages=[{"role": "system", "content": SYSTEM_BLIX_CONCEPT},
+                  {"role": "user", "content": prompt}])
+    item = json.loads(response.choices[0].message.content or "{}")
+    scene, post, visual = (str(item.get(k, "")).strip() for k in ("scene", "post", "visual_prompt"))
+    if not all((scene, post, visual)):
+        raise ValueError("Неполная концепция")
+    cid = save_blix_concept({"scene": scene, "post": post, "visual_prompt": visual}, prompt)
+    text = (f"🐈 Концепция Бликса — только на согласование\n\n"
+            f"🎬 Сцена: {scene}\n\n📝 Текст: {post}\n\n"
+            f"🖼 Визуал: {visual}\n\n"
+            "Изображение пока НЕ создано. Для точного облика понадобятся утверждённый "
+            "референс кота и фото реального интерьера BLIKI.")
+    buttons_markup = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Утвердить концепцию", callback_data=f"blixok:{cid}"),
+        InlineKeyboardButton("❌ Отклонить", callback_data=f"blixno:{cid}")
+    ]])
+    await bot.send_message(chat_id=chat_id, text=text[:4000], reply_markup=buttons_markup)
+
+
 async def handle_research_button(update, ctx):
     q = update.callback_query
     if q.from_user.id != OWNER_CHAT_ID:
@@ -411,28 +509,35 @@ async def handle_research_button(update, ctx):
         if mode in ("trends", "viral"):
             await send_research(q.message.chat_id, ctx.bot, mode)
         return
-    if payload.startswith("idea:"):
-        try:
-            _, rid, idx_str = payload.split(":", 2)
-            idx = int(idx_str)
-            ideas = research_get(rid)
-            if not ideas or idx < 0 or idx >= len(ideas):
-                await q.message.reply_text("⚠️ Идея не найдена, запусти поиск заново.")
-                return
-            idea = ideas[idx]
-            # The model creates a post grounded in the selected idea. Do not claim a real work already exists.
-            caption = (f"Напиши пост-приглашение обсудить идею дизайна: {idea['title']}. "
-                       f"Тема: {idea['post']}. Хук: {idea['hook']}. "
-                       "Это концепт для будущей работы, а не фото готового маникюра. "
-                       "Не выдумывай наличие такого дизайна у мастеров или свободные слоты. "
-                       "Не используй реплику Бликса, если специально не просят.")
-            result = await ai_post(caption=caption)
-            if not result:
-                raise ValueError("Пустой текст")
-            await show_draft_from_chat(q.message.chat_id, ctx.bot, result, caption)
-        except Exception:
-            log.exception("Create draft from research idea failed")
-            await q.message.reply_text("❌ Не удалось создать черновик из идеи.")
+    try:
+        action, rid, idx_str = payload.split(":", 2)
+        idx = int(idx_str)
+        ideas = research_get(rid)
+        if not ideas or idx < 0 or idx >= len(ideas):
+            await q.message.reply_text("⚠️ Идея не найдена. Запусти поиск заново.")
+            return
+        if action == "drop":
+            review_idea(rid, idx, "rejected")
+            await q.edit_message_reply_markup(reply_markup=None)
+            await q.message.reply_text("❌ Идея отклонена, публикации не будет.")
+            return
+        if action == "pick":
+            review_idea(rid, idx, "approved")
+            await q.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✍️ Обычный пост", callback_data=f"idea:{rid}:{idx}"),
+                InlineKeyboardButton("🐈 Обыграть с Бликсом", callback_data=f"blix:{rid}:{idx}")
+            ]]))
+            return
+        if action not in ("idea", "blix") or idea_review(rid, idx) != "approved":
+            await q.message.reply_text("⚠️ Сначала утверди идею.")
+            return
+        if action == "idea":
+            await create_normal_post(q.message.chat_id, ctx.bot, ideas[idx])
+        else:
+            await create_blix_concept(q.message.chat_id, ctx.bot, ideas[idx])
+    except Exception:
+        log.exception("Research idea approval/generation failed")
+        await q.message.reply_text("❌ Не удалось обработать идею. Посмотри логи Railway.")
 
 
 async def show_draft_from_chat(chat_id, bot, text, caption):
@@ -476,20 +581,43 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.answer("Нет доступа", show_alert=True)
         return
     await query.answer()
-    if query.data.startswith(("idea:", "more:")):
+    if query.data.startswith(("idea:", "more:", "pick:", "drop:", "blix:")):
         await handle_research_button(update, ctx)
         return
     try:
         action, draft_id = query.data.split(":", 1)
     except ValueError:
         return
-    if action not in ("approve", "retry"):
+    if action in ("blixok", "blixno"):
+        async with publish_lock:
+            concept = read_blix_concept(draft_id)
+            if not concept or concept["status"] != "pending":
+                await query.message.reply_text("⚠️ Концепция уже обработана или недоступна.")
+                return
+            with connect_db() as db:
+                db.execute("UPDATE blix_concepts SET status=? WHERE id=? AND status='pending'",
+                           ("approved" if action == "blixok" else "rejected", draft_id))
+            await query.edit_message_reply_markup(reply_markup=None)
+            if action == "blixok":
+                await show_draft_from_chat(query.message.chat_id, ctx.bot, concept["text"],
+                                           "Пост от Бликса. " + concept["source_caption"])
+                await query.message.reply_text("✅ Концепция одобрена. Текст создан как черновик; "
+                                               "визуал отдельно, без автоматической генерации кота.")
+            else:
+                await query.message.reply_text("❌ Концепция Бликса отклонена.")
+        return
+    if action not in ("approve", "retry", "reject"):
         return
     # Serialize mutations and publication to avoid double sends and retry/publish races.
     async with publish_lock:
         draft = read_draft(draft_id)
         if not draft or draft["status"] != "pending":
             await query.edit_message_text("⚠️ Черновик недоступен или уже опубликован.")
+            return
+        if action == "reject":
+            with connect_db() as db:
+                db.execute("UPDATE drafts SET status='rejected' WHERE id=? AND status='pending'", (draft_id,))
+            await query.edit_message_text("❌ Черновик отклонён. Ничего не опубликовано.")
             return
         if action == "approve":
             text = draft["text"]
