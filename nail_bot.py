@@ -1,12 +1,14 @@
 """BLIKI Telegram content bot. Start on Railway: python3 nail_bot.py
 
 Required environment: BOT_TOKEN, OPENAI_KEY, CHANNEL_ID, OWNER_CHAT_ID.
-Optional: OPENAI_MODEL (gpt-4o-mini), DB_PATH (drafts.sqlite3), BOOKING_URL,
-TAVILY_API_KEY (needed for web search buttons).
+Optional: OPENAI_MODEL (gpt-4o-mini), TRANSCRIBE_MODEL (gpt-4o-mini-transcribe),
+DB_PATH (drafts.sqlite3), BOOKING_URL, TAVILY_API_KEY (needed for search buttons).
 Requires: python-telegram-bot>=21,<23; openai>=1,<3; APScheduler>=3.10,<4; httpx>=0.27,<1.
 """
 import asyncio
 import base64
+import io
+import random
 import json
 import logging
 import os
@@ -20,7 +22,7 @@ from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from openai import AsyncOpenAI
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 )
@@ -30,6 +32,7 @@ OPENAI_KEY = os.environ["OPENAI_KEY"]
 CHANNEL_ID = os.environ["CHANNEL_ID"]
 OWNER_CHAT_ID = int(os.environ["OWNER_CHAT_ID"])
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+TRANSCRIBE_MODEL = os.getenv("TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe")
 DB_PATH = os.getenv("DB_PATH", "drafts.sqlite3")
 BOOKING_URL = os.getenv("BOOKING_URL", "").strip()
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "").strip()
@@ -40,25 +43,59 @@ log = logging.getLogger("bliki")
 ai = AsyncOpenAI(api_key=OPENAI_KEY, timeout=60.0)
 publish_lock = asyncio.Lock()
 
-SYSTEM_POST = """Ты редактор Telegram-канала маникюрной студии BLIKI (Челябинск, район Академ Riverside).
-Цель — показывать реальные работы мастеров, формировать доверие и интерес к записи.
-Пиши естественно, с характером, без пафоса, чрезмерных метафор, штампов и выдуманных фактов.
-Обычно 200–450 символов; можно короче. Конкретные видимые детали важнее пустых эпитетов.
-Не придумывай технику, материал, марку, цены, акции, доступное время или адрес.
-Не делай обязательный вопрос в конце. Не добавляй призыв записаться в каждый пост.
-Максимум два уместных хештега (допустим #работыBLIKI), без общих наборов. Максимум два эмодзи.
-Если дано только видео без описания содержания, не заявляй, будто рассмотрел кадры.
-Не изображай персонажа Бликса, если владелец об этом не попросил.
-Возвращай только готовый текст публикации, без комментариев и кавычек."""
+SYSTEM_POST = """Ты редактор Telegram-канала студии маникюра BLIKI в Челябинске.
+Цель — заинтересовать местных клиенток, показать ценность студии, её мастеров и реальные работы.
+
+ПРИОРИТЕТ НОМЕР ОДИН — конкретное задание владельца. Если он просит пост про мастеров,
+их заботу о клиентках и качество работы, пиши ИМЕННО ПРО МАСТЕРОВ, а не о цветах, погоде
+или красоте вообще. Сохраняй ключевые смыслы и действующих лиц из задания.
+Фото — дополнительный источник деталей, но не повод подменять тему владельца.
+
+СТИЛЬ: современный живой русский язык, небанальный и естественный тон небольшой студии.
+Разрешены лёгкая ирония, характер, точное наблюдение, короткие предложения.
+Не используй затёртые вступления («каждая девушка мечтает», «подарите себе»,
+«в мире красоты», «не просто маникюр, а»), напыщенные метафоры, пустые похвалы.
+Варьируй композицию и длину: обычно 150–450 символов, но не подгоняй текст под норму.
+Не вставляй вопрос, эмодзи, хештег, хвалебный эпитет или призыв записаться механически.
+Хештегов максимум 2, только если они полезны; эмодзи максимум 2.
+Не упоминай сезон, время года, погоду, праздники или тренд без прямой связи с заданием.
+Даже если дата или сезон известны, это не тема по умолчанию.
+Не придумывай факты, цены, сроки, покрытия, имена мастеров и результаты работ.
+Не изображай Бликса без явного запроса владельца. Если дано только видео без описания,
+не утверждай, будто просмотрел видео. Возвращай только готовый пост без пояснений."""
+
+SYSTEM_REFINE = """Ты редактор, выполняющий ТОЧЕЧНОЕ исправление уже согласуемого поста BLIKI.
+Верни только JSON вида: {"edits":[{"old":"точная непрерывная цитата из оригинала","new":"новый фрагмент"}]}.
+
+Обязательные правила:
+- Измени только то, что прямо указано владельцем. Всё остальное оставь ПОБАЙТОВО без изменений.
+- Для каждой правки скопируй в old точный фрагмент исходного текста (с пунктуацией и пробелами),
+  присутствующий в оригинале РОВНО ОДИН РАЗ. В new — только его замена.
+- Если владелец просит поменять первый абзац — цитируй только первый абзац; второй не трогай.
+- Для вставки текста выбери короткий уникальный соседний фрагмент в old, а в new верни этот
+  фрагмент вместе со вставкой. Для удаления — new может быть пустой строкой.
+- Не переписывай целиком пост, если не попросили явно. Не изменяй заголовок, призыв,
+  эмодзи, хештеги и соседние абзацы без запроса. Не придумывай фактов.
+- Если поправить ничего нельзя, верни {"edits":[]}.
+"""
+
+STYLE_ANGLES = (
+    "Сфокусируйся на одном свежем наблюдении; начало без шаблонного рекламного обращения.",
+    "Пиши ёмко и разговорно, словно умный редактор небольшого местного бренда.",
+    "Используй немного дерзости и остроумия, но уважительно к клиенткам и мастерам.",
+    "Предпочти конкретику и индивидуальность работы общим красивым словам.",
+    "Сделай выразительный, но простой пост без риторических вопросов и лозунгов.",
+)
 
 SYSTEM_CHAT = """Ты дружелюбный помощник владельца маникюрной студии BLIKI.
 Отвечай кратко и по делу. Не выдумывай факты о студии."""
 
 SYSTEM_IDEAS = """Ты помощник студии маникюра BLIKI в Челябинске.
-Предложи идеи сезонного контента на ближайшую неделю. У тебя нет доступа к живому интернету;
-не выдавай идеи за проверенные свежие тренды. Верни только JSON с ключами:
- top_trend (строка — идея недели), trends (массив из 3 идей), colors (массив из 3 цветов),
- summary (краткий план на неделю)."""
+Предложи разнообразные идеи контента на ближайшую неделю: мастера, реальные работы,
+забота о клиентках, полезные советы, форматы коротких видео и запись. Не своди всю
+неделю к времени года. Сезонную тему предложи только если она действительно уместна.
+У тебя нет живого доступа к интернету; не называй идеи проверенными трендами.
+Верни JSON с ключами top_trend, trends (3 идеи), colors (3 цвета), summary."""
 
 
 def now_local() -> datetime:
@@ -67,7 +104,8 @@ def now_local() -> datetime:
 
 def season() -> str:
     m = now_local().month
-    return "зима" if m in (12, 1, 2) else "весна" if m in (3, 4, 5) else "лето" if m in (6, 7, 8) else "осень"
+    # Практическое деление для Челябинска: ноябрь воспринимается как зимний месяц.
+    return "зима" if m in (11, 12, 1, 2, 3) else "весна" if m in (4, 5) else "лето" if m in (6, 7, 8) else "осень"
 
 
 def connect_db():
@@ -102,6 +140,17 @@ def init_db():
             scene TEXT NOT NULL, visual_prompt TEXT NOT NULL,
             source_caption TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending'
         )""")
+        db.execute("""CREATE TABLE IF NOT EXISTS edit_sessions (
+            owner_id INTEGER NOT NULL, chat_id INTEGER NOT NULL,
+            draft_id TEXT NOT NULL, draft_message_id INTEGER NOT NULL,
+            prompt_message_id INTEGER NOT NULL, created_at TEXT NOT NULL,
+            PRIMARY KEY(owner_id, chat_id)
+        )""")
+        db.execute("""CREATE TABLE IF NOT EXISTS draft_revisions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            draft_id TEXT NOT NULL, previous_text TEXT NOT NULL,
+            next_text TEXT NOT NULL, reason TEXT NOT NULL, created_at TEXT NOT NULL
+        )""")
 
 
 def save_draft(text, source_caption="", media_type=None, file_id=None):
@@ -118,9 +167,39 @@ def read_draft(draft_id):
     return dict(item) if item else None
 
 
-def update_draft(draft_id, text):
+def update_draft(draft_id, text, reason="rewrite"):
     with connect_db() as db:
-        db.execute("UPDATE drafts SET text=? WHERE id=? AND status='pending'", (text, draft_id))
+        row = db.execute("SELECT text FROM drafts WHERE id=? AND owner_id=? AND status='pending'",
+                         (draft_id, OWNER_CHAT_ID)).fetchone()
+        if not row:
+            raise ValueError("Черновик уже обработан")
+        db.execute("""INSERT INTO draft_revisions(draft_id,previous_text,next_text,reason,created_at)
+                      VALUES(?,?,?,?,?)""", (draft_id, row["text"], text, reason, now_local().isoformat()))
+        db.execute("UPDATE drafts SET text=? WHERE id=? AND owner_id=? AND status='pending'",
+                   (text, draft_id, OWNER_CHAT_ID))
+
+
+def save_edit_session(chat_id, draft_id, draft_message_id, prompt_message_id):
+    with connect_db() as db:
+        db.execute("""INSERT INTO edit_sessions(owner_id,chat_id,draft_id,draft_message_id,
+                      prompt_message_id,created_at) VALUES(?,?,?,?,?,?)
+                      ON CONFLICT(owner_id,chat_id) DO UPDATE SET
+                      draft_id=excluded.draft_id,draft_message_id=excluded.draft_message_id,
+                      prompt_message_id=excluded.prompt_message_id,created_at=excluded.created_at""",
+                   (OWNER_CHAT_ID, chat_id, draft_id, draft_message_id,
+                    prompt_message_id, now_local().isoformat()))
+
+
+def read_edit_session(chat_id):
+    with connect_db() as db:
+        row = db.execute("SELECT * FROM edit_sessions WHERE owner_id=? AND chat_id=?",
+                         (OWNER_CHAT_ID, chat_id)).fetchone()
+    return dict(row) if row else None
+
+
+def clear_edit_session(chat_id):
+    with connect_db() as db:
+        db.execute("DELETE FROM edit_sessions WHERE owner_id=? AND chat_id=?", (OWNER_CHAT_ID, chat_id))
 
 
 def mark_published(draft_id):
@@ -129,30 +208,103 @@ def mark_published(draft_id):
 
 
 def buttons(draft_id):
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Опубликовать", callback_data=f"approve:{draft_id}"),
-        InlineKeyboardButton("🔄 Переписать", callback_data=f"retry:{draft_id}"),
-        InlineKeyboardButton("❌ Отклонить", callback_data=f"reject:{draft_id}"),
-    ]])
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Опубликовать", callback_data=f"approve:{draft_id}"),
+         InlineKeyboardButton("🔄 Переписать", callback_data=f"retry:{draft_id}")],
+        [InlineKeyboardButton("✏️ Уточнить", callback_data=f"refine:{draft_id}"),
+         InlineKeyboardButton("❌ Отклонить", callback_data=f"reject:{draft_id}")],
+    ])
+
+
+def recent_openings(limit=5):
+    """Only for stylistic variety, never as factual input for the next post."""
+    with connect_db() as db:
+        rows = db.execute("SELECT text FROM drafts WHERE owner_id=? ORDER BY rowid DESC LIMIT ?",
+                          (OWNER_CHAT_ID, limit)).fetchall()
+    return [row["text"].split("\n", 1)[0][:90] for row in rows if row["text"].strip()]
 
 
 async def ai_post(caption="", image_bytes=None, mime="image/jpeg", old_text=None, is_video=False):
-    instruction = ("Перепиши следующий пост существенно иначе, но без выдумок.\n"
-                   f"Предыдущий текст:\n{old_text}\n\n" if old_text else "Напиши пост.\n")
-    instruction += f"Пожелание владельца: {caption or 'нет'}. Сезон: {season()}."
+    if old_text:
+        instruction = ("Создай ДРУГОЙ вариант поста, сохраняя исходное ТЗ владельца, "
+                       "а не навязывая новую тему. Измени композицию и начало.\n"
+                       f"Текущий вариант:\n{old_text}\n\n")
+    else:
+        instruction = "Создай публикацию по заданию владельца.\n"
+    instruction += (f"ГЛАВНОЕ ЗАДАНИЕ ВЛАДЕЛЬЦА: {caption or 'Показать именно то, что изображено на фото'}.\n"
+                    "Не добавляй сезонную тему от себя. Если просьба о людях — говори о людях; "
+                    "если об услуге — об услуге.\n"
+                    f"Редакторская подача: {random.choice(STYLE_ANGLES)}")
+    if not old_text:
+        openings = recent_openings()
+        if openings:
+            instruction += ("\nНачала последних постов (НЕ повторяй их стиль или конструкцию; "
+                            "это примеры для исключения, не источник фактов): "
+                            + json.dumps(openings, ensure_ascii=False))
     if is_video:
-        instruction += " Приложено видео, но ты не видишь его содержимое: опирайся только на описание владельца."
+        instruction += "\nПриложено видео, но кадров ты не видишь: строго по описанию владельца."
     elif image_bytes is None:
-        instruction += " Фотографии нет; не описывай несуществующее изображение."
+        instruction += "\nФотографии нет: не описывай якобы увиденное изображение."
     content = [{"type": "text", "text": instruction}]
     if image_bytes is not None:
         encoded = base64.b64encode(image_bytes).decode("ascii")
         content.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{encoded}", "detail": "low"}})
     result = await ai.chat.completions.create(
         model=OPENAI_MODEL, messages=[{"role": "system", "content": SYSTEM_POST},
-                                      {"role": "user", "content": content}], max_tokens=600,
+                                      {"role": "user", "content": content}], max_tokens=650,
     )
     return (result.choices[0].message.content or "").strip()
+
+
+def apply_literal_edits(original, edits):
+    """Apply only exact, uniquely identifiable spans; everything else is unchanged."""
+    if not isinstance(edits, list) or not (1 <= len(edits) <= 6):
+        raise ValueError("Нет подходящих точечных изменений")
+    spans = []
+    for entry in edits:
+        if not isinstance(entry, dict):
+            raise ValueError("Некорректная структура правки")
+        old, new = entry.get("old"), entry.get("new")
+        if not isinstance(old, str) or not old or not isinstance(new, str):
+            raise ValueError("Фрагмент для замены не указан")
+        if original.count(old) != 1:
+            raise ValueError("Фрагмент исходного текста не совпал однозначно")
+        if old == new:
+            continue
+        at = original.index(old)
+        spans.append((at, at + len(old), new))
+    if not spans:
+        raise ValueError("Правки не изменили текст")
+    spans.sort()
+    if any(a[1] > b[0] for a, b in zip(spans, spans[1:])):
+        raise ValueError("Правки пересекаются")
+    result = original
+    for start, stop, new in reversed(spans):
+        result = result[:start] + new + result[stop:]
+    return result
+
+
+async def ai_refine(original, instruction, source_caption):
+    prompt = json.dumps({"original_post": original, "original_brief": source_caption,
+                         "requested_change": instruction}, ensure_ascii=False)
+    for attempt in range(2):
+        response = await ai.chat.completions.create(
+            model=OPENAI_MODEL, max_tokens=1500, response_format={"type": "json_object"},
+            messages=[{"role": "system", "content": SYSTEM_REFINE},
+                      {"role": "user", "content": prompt}],
+        )
+        data = json.loads(response.choices[0].message.content or "{}")
+        try:
+            result = apply_literal_edits(original, data.get("edits"))
+            if len(result) > 4000:
+                raise ValueError("Исправленный пост слишком длинный для предпросмотра")
+            return result
+        except ValueError as exc:
+            if attempt:
+                raise
+            prompt += ("\nПРЕДЫДУЩАЯ ПОПЫТКА НЕ ПОДОШЛА: " + str(exc)
+                       + ". Используй ТОЧНЫЕ цитаты из оригинала, не переписывай остальное.")
+    raise ValueError("Не удалось сформировать точечную правку")
 
 
 async def fetch_photo_bytes(ctx, file_id):
@@ -161,6 +313,7 @@ async def fetch_photo_bytes(ctx, file_id):
 
 
 async def show_draft(update, text, caption="", media_type=None, file_id=None):
+    clear_edit_session(update.effective_message.chat_id)
     draft_id = save_draft(text, caption, media_type, file_id)
     await update.effective_message.reply_text(f"📝 Черновик:\n\n{text}", reply_markup=buttons(draft_id))
 
@@ -244,7 +397,7 @@ async def collect_sources(mode):
     queries = (
         [f"маникюр тренды дизайна ногтей {current:%m.%Y} идеи цвета nail art",
          f"nail design trends popular nail art {current:%B %Y}",
-         f"маникюр тенденции дизайны ногтей осень зима {current:%Y} отзывы"]
+         f"маникюр актуальные дизайны ногтей {current:%m.%Y} техники идеи"]
         if mode == "trends" else
         [f"viral nail art designs TikTok Instagram Reels popular {current:%B %Y} views",
          f"most viewed nail art reels viral design {current:%Y}",
@@ -541,8 +694,80 @@ async def handle_research_button(update, ctx):
 
 
 async def show_draft_from_chat(chat_id, bot, text, caption):
+    clear_edit_session(chat_id)
     draft_id = save_draft(text, caption)
     await bot.send_message(chat_id=chat_id, text=f"📝 Черновик:\n\n{text}", reply_markup=buttons(draft_id))
+
+
+async def apply_refinement_message(update, ctx, instruction):
+    msg = update.effective_message
+    chat_id = msg.chat_id
+    session = read_edit_session(chat_id)
+    if not session:
+        await msg.reply_text("⚠️ Не вижу ожидающей правки. Нажми «✏️ Уточнить» под черновиком.")
+        return
+    # Replying to an older prompt must not accidentally edit a different draft.
+    replied = msg.reply_to_message
+    if replied and replied.message_id != session["prompt_message_id"]:
+        await msg.reply_text("⚠️ Сейчас выбран другой черновик. Ответь на последнее сообщение «Что уточнить?». ")
+        return
+    if not instruction.strip():
+        await msg.reply_text("⚠️ Напиши, что именно изменить в тексте.")
+        return
+    await msg.reply_text("✏️ Исправляю только указанную часть, остальное сохраняю…")
+    async with publish_lock:
+        draft = read_draft(session["draft_id"])
+        if not draft or draft["status"] != "pending":
+            clear_edit_session(chat_id)
+            await msg.reply_text("⚠️ Черновик уже обработан. Правка отменена.")
+            return
+        try:
+            new_text = await ai_refine(draft["text"], instruction.strip(), draft["source_caption"])
+            if draft["media_type"] in ("photo", "video", "animation") and len(new_text) > 1024:
+                raise ValueError("Подпись к фото/видео не может быть длиннее 1024 символов")
+            update_draft(draft["id"], new_text, reason="refine: " + instruction.strip()[:180])
+            clear_edit_session(chat_id)
+        except Exception:
+            log.exception("Precise refinement failed for draft %s", session["draft_id"])
+            await msg.reply_text("❌ Не смогла надёжно изменить только выбранную часть. "
+                                 "Черновик НЕ изменён. Уточни конкретную фразу или абзац и попробуй снова.")
+            return
+    preview = f"📝 Уточнённый вариант:\n\n{new_text}"
+    try:
+        await ctx.bot.edit_message_text(chat_id=chat_id,
+                                        message_id=session["draft_message_id"],
+                                        text=preview, reply_markup=buttons(draft["id"]))
+    except Exception:
+        # The editing prompt may outlive its original preview; still provide usable buttons.
+        log.exception("Could not update existing draft preview; sending a new one")
+        await msg.reply_text(preview, reply_markup=buttons(draft["id"]))
+    await msg.reply_text("✅ Исправила указанное. Остальные фрагменты остались без изменений.")
+
+
+async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_CHAT_ID:
+        return
+    msg = update.effective_message
+    if not read_edit_session(msg.chat_id):
+        await msg.reply_text("Чтобы поправить черновик голосом, сначала нажми «✏️ Уточнить».")
+        return
+    try:
+        if msg.voice.file_size and msg.voice.file_size > 15 * 1024 * 1024:
+            raise ValueError("Слишком длинное голосовое сообщение")
+        tg_file = await ctx.bot.get_file(msg.voice.file_id)
+        audio = bytes(await tg_file.download_as_bytearray())
+        voice_file = io.BytesIO(audio)
+        voice_file.name = "clarification.ogg"
+        transcription = await ai.audio.transcriptions.create(model=TRANSCRIBE_MODEL, file=voice_file)
+        instruction = (transcription.text or "").strip()
+        if not instruction:
+            await msg.reply_text("❌ Не расслышала уточнение. Напиши его текстом.")
+            return
+        await msg.reply_text(f"🎙 Распознала: {instruction[:900]}")
+        await apply_refinement_message(update, ctx, instruction)
+    except Exception:
+        log.exception("Could not transcribe voice edit")
+        await msg.reply_text("❌ Не удалось распознать голосовое. Можно просто написать уточнение текстом.")
 
 
 async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -551,10 +776,19 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     user_text = (msg.text or "").strip()
     if user_text == "🔥 Найти тренды":
+        clear_edit_session(msg.chat_id)
         await send_research(msg.chat_id, ctx.bot, "trends")
         return
     if user_text == "🚀 Вирусные дизайны":
+        clear_edit_session(msg.chat_id)
         await send_research(msg.chat_id, ctx.bot, "viral")
+        return
+    if read_edit_session(msg.chat_id):
+        if user_text.casefold() in ("отмена", "отменить", "/cancel"):
+            clear_edit_session(msg.chat_id)
+            await msg.reply_text("👌 Уточнение отменено, исходный черновик не затронут.")
+        else:
+            await apply_refinement_message(update, ctx, user_text)
         return
     triggers = ("напиши пост", "сделай пост", "пост на тему", "сгенерируй пост")
     try:
@@ -606,7 +840,7 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             else:
                 await query.message.reply_text("❌ Концепция Бликса отклонена.")
         return
-    if action not in ("approve", "retry", "reject"):
+    if action not in ("approve", "retry", "reject", "refine"):
         return
     # Serialize mutations and publication to avoid double sends and retry/publish races.
     async with publish_lock:
@@ -614,7 +848,17 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not draft or draft["status"] != "pending":
             await query.edit_message_text("⚠️ Черновик недоступен или уже опубликован.")
             return
+        if action == "refine":
+            prompt = await query.message.reply_text(
+                "✏️ Что именно поменять в этом посте?\n\n"
+                "Напиши, например: «Измени только первый абзац, сделай его живее. "
+                "Второй оставь без изменений». Можно отправить и голосовое.\n\n"
+                "Для отмены напиши «Отмена».",
+                reply_markup=ForceReply(selective=True, input_field_placeholder="Измени только..."))
+            save_edit_session(query.message.chat_id, draft_id, query.message.message_id, prompt.message_id)
+            return
         if action == "reject":
+            clear_edit_session(query.message.chat_id)
             with connect_db() as db:
                 db.execute("UPDATE drafts SET status='rejected' WHERE id=? AND status='pending'", (draft_id,))
             await query.edit_message_text("❌ Черновик отклонён. Ничего не опубликовано.")
@@ -635,6 +879,7 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 else:
                     await ctx.bot.send_message(chat_id=CHANNEL_ID, text=text)
                 mark_published(draft_id)
+                clear_edit_session(query.message.chat_id)
                 await query.edit_message_text("✅ Опубликовано в канале!")
             except Exception:
                 log.exception("Publishing failed for draft %s", draft_id)
@@ -647,7 +892,8 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                                          is_video=draft["media_type"] in ("video", "animation"))
                 if not new_text:
                     raise ValueError("Пустой ответ модели")
-                update_draft(draft_id, new_text)
+                update_draft(draft_id, new_text, reason="rewrite")
+                clear_edit_session(query.message.chat_id)
                 await query.edit_message_text(f"📝 Новый вариант:\n\n{new_text}", reply_markup=buttons(draft_id))
             except Exception:
                 log.exception("Rewrite failed for draft %s", draft_id)
@@ -703,6 +949,7 @@ def main():
                    .post_init(after_start).post_shutdown(before_stop).build())
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.VIDEO | filters.ANIMATION, handle_video))
+    application.add_handler(MessageHandler(filters.VOICE, handle_voice))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     application.add_handler(CallbackQueryHandler(handle_button))
     log.info("Starting BLIKI bot via Telegram polling...")
