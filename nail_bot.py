@@ -22,7 +22,7 @@ from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from openai import AsyncOpenAI
-from telegram import ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
 from telegram.ext import (
     Application, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 )
@@ -43,6 +43,11 @@ log = logging.getLogger("bliki")
 ai = AsyncOpenAI(api_key=OPENAI_KEY, timeout=60.0)
 publish_lock = asyncio.Lock()
 
+# Telegram delivers an album as separate updates, without an end marker.
+ALBUM_IDLE_SECONDS = 3.0
+album_buffers = {}
+album_closed = {}
+
 SYSTEM_POST = """Ты редактор Telegram-канала студии маникюра BLIKI в Челябинске.
 Цель — заинтересовать местных клиенток, показать ценность студии, её мастеров и реальные работы.
 
@@ -55,6 +60,11 @@ SYSTEM_POST = """Ты редактор Telegram-канала студии ман
 Разрешены лёгкая ирония, характер, точное наблюдение, короткие предложения.
 Не используй затёртые вступления («каждая девушка мечтает», «подарите себе»,
 «в мире красоты», «не просто маникюр, а»), напыщенные метафоры, пустые похвалы.
+Избегай автоматических фраз «это тот случай, когда», «каждая деталь продумана»,
+«атмосфера заботы и уюта», «подчеркнёт индивидуальность», «для тех, кто ценит»;
+их смысл допустим, но объясняй его собственными словами через конкретику.
+Никаких одинаковых рекламных концовок и искусственно придуманных историй о клиентках.
+Не хвали услугу без причины; говори как настоящая команда небольшой студии.
 Варьируй композицию и длину: обычно 150–450 символов, но не подгоняй текст под норму.
 Не вставляй вопрос, эмодзи, хештег, хвалебный эпитет или призыв записаться механически.
 Хештегов максимум 2, только если они полезны; эмодзи максимум 2.
@@ -151,6 +161,21 @@ def init_db():
             draft_id TEXT NOT NULL, previous_text TEXT NOT NULL,
             next_text TEXT NOT NULL, reason TEXT NOT NULL, created_at TEXT NOT NULL
         )""")
+        # Persist which Telegram preview message belongs to each draft.
+        # Added separately: existing Railway SQLite databases migrate in place.
+        db.execute("""CREATE TABLE IF NOT EXISTS draft_messages (
+            owner_id INTEGER NOT NULL, chat_id INTEGER NOT NULL,
+            message_id INTEGER NOT NULL, draft_id TEXT NOT NULL,
+            preview_kind TEXT NOT NULL, created_at TEXT NOT NULL,
+            PRIMARY KEY(owner_id, chat_id, message_id)
+        )""")
+        db.execute("CREATE INDEX IF NOT EXISTS ix_draft_messages_draft ON draft_messages(draft_id)")
+        db.execute("""CREATE TABLE IF NOT EXISTS album_previews (
+            draft_id TEXT PRIMARY KEY, text TEXT NOT NULL, file_id TEXT NOT NULL
+        )""")
+        db.execute("""CREATE TABLE IF NOT EXISTS incomplete_albums (
+            draft_id TEXT PRIMARY KEY, file_id TEXT NOT NULL
+        )""")
 
 
 def save_draft(text, source_caption="", media_type=None, file_id=None):
@@ -177,6 +202,186 @@ def update_draft(draft_id, text, reason="rewrite"):
                       VALUES(?,?,?,?,?)""", (draft_id, row["text"], text, reason, now_local().isoformat()))
         db.execute("UPDATE drafts SET text=? WHERE id=? AND owner_id=? AND status='pending'",
                    (text, draft_id, OWNER_CHAT_ID))
+
+
+def save_draft_preview(chat_id, message_id, draft_id, kind="text"):
+    with connect_db() as db:
+        db.execute("""INSERT OR REPLACE INTO draft_messages
+                   (owner_id,chat_id,message_id,draft_id,preview_kind,created_at)
+                   VALUES(?,?,?,?,?,?)""",
+                   (OWNER_CHAT_ID, chat_id, message_id, draft_id, kind, now_local().isoformat()))
+
+
+def preview_record(chat_id, message_id):
+    with connect_db() as db:
+        row = db.execute("""SELECT * FROM draft_messages
+                        WHERE owner_id=? AND chat_id=? AND message_id=?""",
+                         (OWNER_CHAT_ID, chat_id, message_id)).fetchone()
+    return dict(row) if row else None
+
+
+def attach_media(draft_id, media_type, file_id, new_text=None):
+    """Atomically attach media and optional refined text to a pending draft."""
+    with connect_db() as db:
+        row = db.execute("""SELECT text FROM drafts
+                          WHERE id=? AND owner_id=? AND status='pending'""",
+                         (draft_id, OWNER_CHAT_ID)).fetchone()
+        if not row:
+            raise ValueError("Черновик недоступен")
+        before = row["text"]
+        after = before if new_text is None else new_text
+        if after != before:
+            db.execute("""INSERT INTO draft_revisions
+                         (draft_id,previous_text,next_text,reason,created_at)
+                         VALUES(?,?,?,?,?)""",
+                       (draft_id, before, after, "refine with attached media", now_local().isoformat()))
+        db.execute("""UPDATE drafts SET text=?, media_type=?, file_id=?
+                     WHERE id=? AND owner_id=? AND status='pending'""",
+                   (after, media_type, file_id, draft_id, OWNER_CHAT_ID))
+        return after
+
+
+def album_ids(file_id):
+    """Albums use a JSON list in the existing file_id column; old drafts unchanged."""
+    ids = json.loads(file_id)
+    if not isinstance(ids, list) or not 2 <= len(ids) <= 10 or not all(isinstance(i, str) and i for i in ids):
+        raise ValueError("Некорректный альбом")
+    return ids
+
+
+def album_media(file_id, caption=None):
+    return [InputMediaPhoto(media=fid, caption=caption if i == 0 else None)
+            for i, fid in enumerate(album_ids(file_id))]
+
+
+def latest_control_id(chat_id, draft_id):
+    with connect_db() as db:
+        row = db.execute("""SELECT message_id FROM draft_messages
+            WHERE owner_id=? AND chat_id=? AND draft_id=? AND preview_kind!='album_item'
+            ORDER BY message_id DESC LIMIT 1""", (OWNER_CHAT_ID, chat_id, draft_id)).fetchone()
+    return row["message_id"] if row else None
+
+
+def caption_length(text):
+    """Telegram media captions have a 1024 UTF-16 code-unit limit."""
+    return len(text.encode("utf-16-le")) // 2
+
+
+async def send_draft_preview(bot, chat_id, draft_id, text, media_type=None, file_id=None,
+                             header="📝 Черновик"):
+    """Create a publishable preview and record its Telegram message ID."""
+    markup = buttons(draft_id)
+    if media_type == "album":
+        ids = album_ids(file_id)
+        caption = text if caption_length(text) <= 1024 else (
+            "⚠️ Подпись длиннее 1024 знаков. Сократи текст через «Уточнить».")
+        messages = await bot.send_media_group(chat_id=chat_id, media=album_media(file_id, caption))
+        if len(messages) != len(ids):
+            raise RuntimeError("Не все фото отображены в предпросмотре")
+        for item in messages:
+            save_draft_preview(chat_id, item.message_id, draft_id, "album_item")
+        if caption_length(text) > 1024:
+            for start in range(0, len(text), 1900):
+                await bot.send_message(chat_id=chat_id, text=text[start:start+1900])
+        sent = await bot.send_message(chat_id=chat_id, reply_markup=markup,
+            text=f"📝 Черновик: альбом из {len(ids)} фото. Все снимки и общий текст выше. "
+                 + ("Сократи подпись до 1024 знаков перед публикацией." if caption_length(text) > 1024
+                    else "Ничего не опубликовано. По кнопке «Опубликовать» выйдет весь альбом."))
+        kind = "album_control"
+    elif media_type in ("photo", "video", "animation") and file_id:
+        # Keep media attached even if existing post is too long for its caption.
+        # Publication will be blocked until the owner shortens the text.
+        if caption_length(text) <= 1024:
+            caption = text
+        else:
+            caption = "📎 Медиа прикреплено. Подпись длиннее лимита Telegram (1024). Сократи текст через «Уточнить»."
+        params = dict(chat_id=chat_id, caption=caption, reply_markup=markup)
+        if media_type == "photo":
+            sent = await bot.send_photo(photo=file_id, **params)
+        elif media_type == "video":
+            sent = await bot.send_video(video=file_id, **params)
+        else:
+            sent = await bot.send_animation(animation=file_id, **params)
+        kind = "media"
+        if caption_length(text) > 1024:
+            await bot.send_message(chat_id=chat_id, text=f"📝 Полный текст черновика:\n\n{text[:3900]}")
+    else:
+        sent = await bot.send_message(chat_id=chat_id,
+                                      text=f"{header}:\n\n{text}", reply_markup=markup)
+        kind = "text"
+    save_draft_preview(chat_id, sent.message_id, draft_id, kind)
+    if media_type == "album":
+        with connect_db() as db:
+            db.execute("INSERT OR REPLACE INTO album_previews(draft_id,text,file_id) VALUES(?,?,?)",
+                       (draft_id, text, file_id))
+    return sent
+
+
+async def refresh_preview(bot, chat_id, message_id, draft_id, text):
+    """After a rewrite/refinement, edit the correct kind of Telegram message."""
+    record = preview_record(chat_id, message_id)
+    if record and record["preview_kind"] == "media":
+        caption = text if caption_length(text) <= 1024 else (
+            "📎 Медиа прикреплено. Подпись длиннее 1024 знаков. Сократи её через «Уточнить».")
+        await bot.edit_message_caption(chat_id=chat_id, message_id=message_id,
+                                       caption=caption, reply_markup=buttons(draft_id))
+        if caption_length(text) > 1024:
+            await bot.send_message(chat_id=chat_id, text=f"📝 Полный текст:\n\n{text[:3900]}")
+    else:
+        await bot.edit_message_text(chat_id=chat_id, message_id=message_id,
+                                    text=f"📝 Черновик:\n\n{text}", reply_markup=buttons(draft_id))
+
+
+async def send_current_draft_preview(bot, chat_id, old_message_id, draft_id,
+                                     text, media_type=None, file_id=None):
+    """Always show attached media together with the latest text.
+
+    Telegram cannot turn an existing text message into a photo message. For
+    media drafts, send a fresh media+caption preview and retire the old buttons.
+    Pure text drafts keep the previous in-place editing behaviour.
+    """
+    if media_type in ("photo", "video", "animation", "album") and file_id:
+        old_message_id = latest_control_id(chat_id, draft_id) or old_message_id
+        new_preview = await send_draft_preview(
+            bot, chat_id, draft_id, text, media_type, file_id)
+        if old_message_id and new_preview.message_id != old_message_id:
+            try:
+                await bot.edit_message_reply_markup(
+                    chat_id=chat_id, message_id=old_message_id, reply_markup=None)
+            except Exception:
+                log.warning("Could not retire old preview buttons (message %s)",
+                            old_message_id, exc_info=True)
+        return new_preview
+    await refresh_preview(bot, chat_id, old_message_id, draft_id, text)
+    return None
+
+
+def is_lost_draft_reply(reply):
+    """Detect a reply to a draft/edit prompt if its SQLite session was lost."""
+    if reply is None or not getattr(getattr(reply, "from_user", None), "is_bot", False):
+        return False
+    content = (getattr(reply, "text", None) or getattr(reply, "caption", None) or "")
+    if any(marker in content for marker in (
+        "Что именно поменять в этом посте?", "📝 Черновик:",
+        "📝 Новый вариант:", "📝 Полный текст черновика:")):
+        return True
+    # Photo previews have the post itself as caption (without a draft header).
+    # Its inline callbacks still identify it as a draft when DB mapping is lost.
+    markup = getattr(reply, "reply_markup", None)
+    for row in (getattr(markup, "inline_keyboard", None) or []):
+        for button in row:
+            callback = getattr(button, "callback_data", None) or ""
+            if callback.startswith(("approve:", "retry:", "refine:", "reject:")):
+                return True
+    return False
+
+
+async def finish_preview(query, text):
+    """Telegram cannot edit a photo's caption using edit_message_text."""
+    if query.message.photo or query.message.video or query.message.animation:
+        await query.edit_message_caption(caption=text, reply_markup=None)
+    else:
+        await query.edit_message_text(text)
 
 
 def save_edit_session(chat_id, draft_id, draft_message_id, prompt_message_id):
@@ -245,9 +450,11 @@ async def ai_post(caption="", image_bytes=None, mime="image/jpeg", old_text=None
         instruction += "\nПриложено видео, но кадров ты не видишь: строго по описанию владельца."
     elif image_bytes is None:
         instruction += "\nФотографии нет: не описывай якобы увиденное изображение."
+    if isinstance(image_bytes, list):
+        instruction += "\nЭто один альбом. Рассмотри все фотографии вместе и напиши один общий пост, не отдельные подписи."
     content = [{"type": "text", "text": instruction}]
-    if image_bytes is not None:
-        encoded = base64.b64encode(image_bytes).decode("ascii")
+    for image in (image_bytes if isinstance(image_bytes, list) else [image_bytes] if image_bytes is not None else []):
+        encoded = base64.b64encode(image).decode("ascii")
         content.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{encoded}", "detail": "low"}})
     result = await ai.chat.completions.create(
         model=OPENAI_MODEL, messages=[{"role": "system", "content": SYSTEM_POST},
@@ -284,14 +491,19 @@ def apply_literal_edits(original, edits):
     return result
 
 
-async def ai_refine(original, instruction, source_caption):
+async def ai_refine(original, instruction, source_caption, image_bytes=None):
     prompt = json.dumps({"original_post": original, "original_brief": source_caption,
                          "requested_change": instruction}, ensure_ascii=False)
     for attempt in range(2):
+        content = [{"type": "text", "text": prompt}]
+        for image in (image_bytes if isinstance(image_bytes, list) else [image_bytes] if image_bytes is not None else []):
+            encoded = base64.b64encode(image).decode("ascii")
+            content.append({"type": "image_url", "image_url": {
+                "url": f"data:image/jpeg;base64,{encoded}", "detail": "low"}})
         response = await ai.chat.completions.create(
             model=OPENAI_MODEL, max_tokens=1500, response_format={"type": "json_object"},
             messages=[{"role": "system", "content": SYSTEM_REFINE},
-                      {"role": "user", "content": prompt}],
+                      {"role": "user", "content": content}],
         )
         data = json.loads(response.choices[0].message.content or "{}")
         try:
@@ -312,10 +524,235 @@ async def fetch_photo_bytes(ctx, file_id):
     return bytes(await tg_file.download_as_bytearray())
 
 
-async def show_draft(update, text, caption="", media_type=None, file_id=None):
-    clear_edit_session(update.effective_message.chat_id)
+async def fetch_draft_images(ctx, media_type, file_id):
+    if media_type == "album":
+        return [await fetch_photo_bytes(ctx, fid) for fid in album_ids(file_id)]
+    if media_type == "photo":
+        return await fetch_photo_bytes(ctx, file_id)
+    return None
+
+
+async def show_draft(update, ctx, text, caption="", media_type=None, file_id=None):
+    chat_id = update.effective_message.chat_id
+    clear_edit_session(chat_id)
     draft_id = save_draft(text, caption, media_type, file_id)
-    await update.effective_message.reply_text(f"📝 Черновик:\n\n{text}", reply_markup=buttons(draft_id))
+    await send_draft_preview(ctx.bot, chat_id, draft_id, text, media_type, file_id)
+
+
+async def try_attach_to_draft(update, ctx, media_type, file_id):
+    """Photo/video + optional correction into existing draft; no new buttons.
+
+    Priority: explicit reply to a saved preview, then current «Уточнить» session.
+    Other photos keep their normal generation behaviour.
+    """
+    msg = update.effective_message
+    if getattr(msg, "media_group_id", None):
+        # Albums contain several messages; silently taking only the last photo
+        # would publish the wrong media. Explicitly require one at a time.
+        if ctx.chat_data.get("last_unsupported_album") != msg.media_group_id:
+            ctx.chat_data["last_unsupported_album"] = msg.media_group_id
+            await msg.reply_text("⚠️ Пока прикрепляй по одному фото, не альбомом.")
+        return True
+    reply = msg.reply_to_message
+    mapped = preview_record(msg.chat_id, reply.message_id) if reply else None
+    session = read_edit_session(msg.chat_id)
+    if mapped:
+        draft_id = mapped["draft_id"]
+        old_preview_id = reply.message_id
+    elif session:
+        if reply and reply.message_id not in (session["prompt_message_id"],
+                                              session["draft_message_id"]):
+            await msg.reply_text("⚠️ Ответ относится к другому сообщению. "
+                                 "Пришли фото ответом на нужный черновик или после «Уточнить» без ответа.")
+            return True
+        draft_id = session["draft_id"]
+        old_preview_id = session["draft_message_id"]
+    else:
+        # A reply to a bot's edit prompt should NEVER silently become a new
+        # post when the edit session was lost (e.g. after a Railway restart).
+        if is_lost_draft_reply(reply):
+            log.warning("Photo reply to draft prompt without saved session, chat %s", msg.chat_id)
+            await msg.reply_text(
+                "⚠️ Не нашла связь с прежним черновиком. Фото не прикреплено "
+                "и новый пост не создан. Нажми «✏️ Уточнить» под нужным "
+                "черновиком и пришли фотографию ещё раз.")
+            return True
+        return False
+    async with publish_lock:
+        draft = read_draft(draft_id)
+        if not draft or draft["status"] != "pending":
+            await msg.reply_text("⚠️ Черновик уже опубликован или отклонён. Фото не прикреплено.")
+            return True
+        media_saved = False
+        try:
+            corrected = None
+            caption_instruction = (msg.caption or "").strip()
+            if caption_instruction:
+                photo_bytes = await fetch_draft_images(ctx, media_type, file_id)
+                # Model sees the picture only when user explicitly asks for a text edit.
+                corrected = await ai_refine(draft["text"], caption_instruction,
+                                            draft["source_caption"], image_bytes=photo_bytes)
+                if not corrected:
+                    raise ValueError("Пустой результат уточнения")
+            text = attach_media(draft_id, media_type, file_id, corrected)
+            media_saved = True
+            # The newest message must contain BOTH the media and the text.
+            await send_current_draft_preview(
+                ctx.bot, msg.chat_id, old_preview_id,
+                draft_id, text, media_type, file_id)
+            if session:
+                clear_edit_session(msg.chat_id)
+            kind_label = "Фото" if media_type == "photo" else "Видео"
+            await msg.reply_text(
+                f"✅ {kind_label} прикреплено к этому черновику. "
+                "В предпросмотре выше — изображение и финальный текст. "
+                "Они будут опубликованы вместе, только когда нажмёшь «✅ Опубликовать»."
+            )
+            if caption_length(text) > 1024:
+                await msg.reply_text("⚠️ Медиа прикреплено, но подпись превышает 1024 знака. "
+                                     "Перед публикацией сократи её через «Уточнить».")
+        except Exception:
+            log.exception("Could not attach %s to draft %s", media_type, draft_id)
+            if media_saved:
+                await msg.reply_text("⚠️ Медиа сохранено в черновике, но не удалось показать новый предпросмотр. "
+                                     "Не нажимай публикацию, пока не проверим текущий вариант.")
+            else:
+                await msg.reply_text("❌ Не удалось прикрепить медиа или применить уточнение. "
+                                     "Черновик не изменён. Попробуй ещё раз без подписи.")
+        return True
+
+
+def album_target(msg):
+    reply = msg.reply_to_message
+    mapped = preview_record(msg.chat_id, reply.message_id) if reply else None
+    session = read_edit_session(msg.chat_id)
+    if mapped:
+        return mapped["draft_id"]
+    if session:
+        if reply and reply.message_id not in (session["prompt_message_id"], session["draft_message_id"]):
+            raise ValueError("Ответ относится к другому сообщению. Выбери нужный черновик.")
+        return session["draft_id"]
+    if is_lost_draft_reply(reply):
+        raise ValueError("Связь с черновиком потеряна. Нажми «Уточнить» и отправь альбом заново.")
+    return None
+
+
+def clear_same_edit_session(chat_id, session):
+    # Album processing is asynchronous; never clear a newer selection.
+    if session and read_edit_session(chat_id) == session:
+        clear_edit_session(chat_id)
+
+
+def mark_incomplete_album(batch):
+    if batch.get("draft_id") and batch.get("file_id"):
+        with connect_db() as db:
+            db.execute("INSERT OR REPLACE INTO incomplete_albums(draft_id,file_id) VALUES(?,?)",
+                       (batch["draft_id"], batch["file_id"]))
+
+
+async def process_album(ctx, batch):
+    messages = [batch["items"][key] for key in sorted(batch["items"])]
+    msg = messages[0]
+    try:
+        if batch["error"]:
+            raise ValueError(batch["error"])
+        if not 2 <= len(messages) <= 10 or any(not item.photo for item in messages):
+            raise ValueError("Нужен альбом из 2–10 фотографий без видео. Отправь его одной группой.")
+        ids = [item.photo[-1].file_id for item in messages]
+        file_id = json.dumps(ids, ensure_ascii=False)
+        batch["file_id"] = file_id
+        captions = list(dict.fromkeys((item.caption or "").strip() for item in messages if (item.caption or "").strip()))
+        brief = "\n".join(captions)
+        target = batch["target"]
+        # Target was captured at the first update, not after waiting for the album.
+        async with publish_lock:
+            if target:
+                draft = read_draft(target)
+                if not draft or draft["status"] != "pending":
+                    raise ValueError("Черновик уже обработан. Альбом не прикреплён.")
+                old_preview = latest_control_id(msg.chat_id, target)
+                corrected = None
+                if brief:
+                    images = await fetch_draft_images(ctx, "album", file_id)
+                    corrected = await ai_refine(draft["text"], brief, draft["source_caption"], image_bytes=images)
+                    if not corrected:
+                        raise ValueError("Не удалось уточнить текст. Альбом не прикреплён.")
+                if batch.get("late"):
+                    raise ValueError("Альбом поступил не полностью. Отправь его заново.")
+                text = attach_media(target, "album", file_id, corrected)
+                clear_same_edit_session(msg.chat_id, batch["session"])
+                draft_id = target
+            else:
+                await msg.reply_text(f"⏳ Получила {len(ids)} фото. Готовлю один общий текст…")
+                images = await fetch_draft_images(ctx, "album", file_id)
+                text = await ai_post(caption=brief, image_bytes=images)
+                if not text:
+                    raise ValueError("Пустой ответ модели")
+                if batch.get("late"):
+                    raise ValueError("Альбом поступил не полностью. Отправь его заново.")
+                draft_id = save_draft(text, brief, "album", file_id)
+                old_preview = None
+            batch["draft_id"] = draft_id
+            with connect_db() as db:
+                db.execute("DELETE FROM incomplete_albums WHERE draft_id=?", (draft_id,))
+            try:
+                await send_current_draft_preview(ctx.bot, msg.chat_id, old_preview, draft_id, text, "album", file_id)
+            except Exception:
+                log.exception("Album saved but preview failed: %s", draft_id)
+                await msg.reply_text("⚠️ Альбом сохранён, но предпросмотр не подтверждён. Не публикуй старый вариант. "
+                                     "Если это существующий черновик, нажми «Уточнить» и пришли альбом снова.")
+    except ValueError as exc:
+        log.warning("Album rejected: %s", exc)
+        await msg.reply_text("⚠️ Альбом не обработан: " + str(exc))
+    except Exception:
+        log.exception("Album processing failed")
+        await msg.reply_text("❌ Не удалось обработать альбом. Проверь логи и отправь его заново.")
+
+
+async def flush_album(ctx, key, batch, revision):
+    await asyncio.sleep(ALBUM_IDLE_SECONDS)
+    if album_buffers.get(key) is not batch or batch["revision"] != revision:
+        return
+    album_buffers.pop(key, None)
+    album_closed[key] = (asyncio.get_running_loop().time(), batch)
+    await process_album(ctx, batch)
+
+
+async def collect_album(update, ctx):
+    msg = update.effective_message
+    key = (msg.chat_id, update.effective_user.id, str(msg.media_group_id))
+    now = asyncio.get_running_loop().time()
+    # Ignore repeat updates. Late arrivals are reported rather than made into a second post.
+    for expired in [k for k, (t, _) in album_closed.items() if now - t > 3600]:
+        album_closed.pop(expired, None)
+    if key in album_closed:
+        _, closed = album_closed[key]
+        if msg.message_id in closed["items"]:
+            return
+        closed["late"] = True
+        mark_incomplete_album(closed)
+        await msg.reply_text("⚠️ Часть альбома пришла слишком поздно. Не публикуй неполный черновик; отклони его и отправь альбом снова.")
+        return
+    batch = album_buffers.get(key)
+    if batch is None:
+        batch = {"items": {}, "revision": 0, "target": None, "session": read_edit_session(msg.chat_id), "error": None}
+        try:
+            batch["target"] = album_target(msg)
+        except ValueError as exc:
+            batch["error"] = str(exc)
+        album_buffers[key] = batch
+    elif msg.reply_to_message:
+        # Check explicit replies, but don't resolve later bare updates against a new session.
+        reply = msg.reply_to_message
+        mapped = preview_record(msg.chat_id, reply.message_id)
+        session = batch["session"]
+        expected = (mapped and mapped["draft_id"]) or (session and reply.message_id in
+            (session["prompt_message_id"], session["draft_message_id"]) and session["draft_id"])
+        if expected != batch["target"] and (mapped or session or is_lost_draft_reply(reply)):
+            batch["error"] = "Фотографии относятся к разным черновикам. Отправь альбом заново."
+    batch["items"][msg.message_id] = msg
+    batch["revision"] += 1
+    ctx.application.create_task(flush_album(ctx, key, batch, batch["revision"]), update=update)
 
 
 async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -323,14 +760,19 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_CHAT_ID:
         await msg.reply_text("⛔ Это приватный бот.")
         return
+    if msg.media_group_id:
+        await collect_album(update, ctx)
+        return
+    file_id = msg.photo[-1].file_id
+    if await try_attach_to_draft(update, ctx, "photo", file_id):
+        return
     await msg.reply_text("⏳ Готовлю текст…")
     try:
-        file_id = msg.photo[-1].file_id
         photo = await fetch_photo_bytes(ctx, file_id)
         text = await ai_post(caption=msg.caption or "", image_bytes=photo)
         if not text:
             raise ValueError("Пустой ответ модели")
-        await show_draft(update, text, msg.caption or "", "photo", file_id)
+        await show_draft(update, ctx, text, msg.caption or "", "photo", file_id)
     except Exception:
         log.exception("Photo post generation failed")
         await msg.reply_text("❌ Не получилось создать пост. Проверь логи и попробуй снова.")
@@ -341,14 +783,19 @@ async def handle_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_CHAT_ID:
         await msg.reply_text("⛔ Это приватный бот.")
         return
+    if msg.media_group_id:
+        await collect_album(update, ctx)
+        return
     file_id = msg.video.file_id if msg.video else msg.animation.file_id
     media_type = "video" if msg.video else "animation"
+    if await try_attach_to_draft(update, ctx, media_type, file_id):
+        return
     await msg.reply_text("⏳ Готовлю подпись к видео по твоему описанию…")
     try:
         text = await ai_post(caption=msg.caption or "", is_video=True)
         if not text:
             raise ValueError("Пустой ответ модели")
-        await show_draft(update, text, msg.caption or "", media_type, file_id)
+        await show_draft(update, ctx, text, msg.caption or "", media_type, file_id)
     except Exception:
         log.exception("Video post generation failed")
         await msg.reply_text("❌ Не удалось создать подпись.")
@@ -696,7 +1143,7 @@ async def handle_research_button(update, ctx):
 async def show_draft_from_chat(chat_id, bot, text, caption):
     clear_edit_session(chat_id)
     draft_id = save_draft(text, caption)
-    await bot.send_message(chat_id=chat_id, text=f"📝 Черновик:\n\n{text}", reply_markup=buttons(draft_id))
+    await send_draft_preview(bot, chat_id, draft_id, text)
 
 
 async def apply_refinement_message(update, ctx, instruction):
@@ -722,8 +1169,9 @@ async def apply_refinement_message(update, ctx, instruction):
             await msg.reply_text("⚠️ Черновик уже обработан. Правка отменена.")
             return
         try:
-            new_text = await ai_refine(draft["text"], instruction.strip(), draft["source_caption"])
-            if draft["media_type"] in ("photo", "video", "animation") and len(new_text) > 1024:
+            new_text = await ai_refine(draft["text"], instruction.strip(), draft["source_caption"],
+                                       image_bytes=await fetch_draft_images(ctx, "album", draft["file_id"]) if draft["media_type"] == "album" else None)
+            if draft["media_type"] in ("photo", "video", "animation", "album") and caption_length(new_text) > 1024:
                 raise ValueError("Подпись к фото/видео не может быть длиннее 1024 символов")
             update_draft(draft["id"], new_text, reason="refine: " + instruction.strip()[:180])
             clear_edit_session(chat_id)
@@ -732,16 +1180,28 @@ async def apply_refinement_message(update, ctx, instruction):
             await msg.reply_text("❌ Не смогла надёжно изменить только выбранную часть. "
                                  "Черновик НЕ изменён. Уточни конкретную фразу или абзац и попробуй снова.")
             return
-    preview = f"📝 Уточнённый вариант:\n\n{new_text}"
     try:
-        await ctx.bot.edit_message_text(chat_id=chat_id,
-                                        message_id=session["draft_message_id"],
-                                        text=preview, reply_markup=buttons(draft["id"]))
+        await send_current_draft_preview(
+            ctx.bot, chat_id, session["draft_message_id"], draft["id"],
+            new_text, draft["media_type"], draft["file_id"])
     except Exception:
-        # The editing prompt may outlive its original preview; still provide usable buttons.
-        log.exception("Could not update existing draft preview; sending a new one")
-        await msg.reply_text(preview, reply_markup=buttons(draft["id"]))
-    await msg.reply_text("✅ Исправила указанное. Остальные фрагменты остались без изменений.")
+        # After a restart some old messages may no longer be editable.
+        log.exception("Could not update current draft preview; sending a new one")
+        try:
+            await send_draft_preview(ctx.bot, chat_id, draft["id"], new_text,
+                                     draft["media_type"], draft["file_id"])
+        except Exception:
+            log.exception("Could not recreate draft preview after refinement")
+            await msg.reply_text("⚠️ Изменения сохранены в черновике, но обновить предпросмотр не удалось. "
+                                 "Не публикуй до проверки фото и текста.")
+            return
+    if draft["media_type"] == "album":
+        await msg.reply_text(f"✅ Правка готова. Все {len(album_ids(draft['file_id']))} фото сохранены. Проверь новый предпросмотр выше.")
+    elif draft["media_type"] in ("photo", "video", "animation") and draft["file_id"]:
+        await msg.reply_text("✅ Точечная правка готова. Фото/видео сохранено: "
+                             "выше новый предпросмотр с медиа и текстом. Пока ничего не опубликовано.")
+    else:
+        await msg.reply_text("✅ Исправила указанное. Остальные фрагменты остались без изменений.")
 
 
 async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -796,7 +1256,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             text = await ai_post(caption=user_text)
             if not text:
                 raise ValueError("Пустой ответ модели")
-            await show_draft(update, text, user_text)
+            await show_draft(update, ctx, text, user_text)
         else:
             result = await ai.chat.completions.create(
                 model=OPENAI_MODEL, max_tokens=450,
@@ -846,14 +1306,19 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     async with publish_lock:
         draft = read_draft(draft_id)
         if not draft or draft["status"] != "pending":
-            await query.edit_message_text("⚠️ Черновик недоступен или уже опубликован.")
+            await finish_preview(query, "⚠️ Черновик недоступен или уже опубликован.")
+            return
+        current_control = latest_control_id(query.message.chat_id, draft_id)
+        if current_control and query.message.message_id != current_control:
+            await query.message.reply_text("⚠️ Это старый предпросмотр. Используй кнопки под последним вариантом.")
             return
         if action == "refine":
             prompt = await query.message.reply_text(
                 "✏️ Что именно поменять в этом посте?\n\n"
                 "Напиши, например: «Измени только первый абзац, сделай его живее. "
                 "Второй оставь без изменений». Можно отправить и голосовое.\n\n"
-                "Для отмены напиши «Отмена».",
+                "Для отмены напиши «Отмена». Фото, альбом (2–10 фото) или видео можно прикрепить здесь же "
+                "без изменения текста; с подписью — уточнить текст по фото.",
                 reply_markup=ForceReply(selective=True, input_field_placeholder="Измени только..."))
             save_edit_session(query.message.chat_id, draft_id, query.message.message_id, prompt.message_id)
             return
@@ -861,16 +1326,30 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             clear_edit_session(query.message.chat_id)
             with connect_db() as db:
                 db.execute("UPDATE drafts SET status='rejected' WHERE id=? AND status='pending'", (draft_id,))
-            await query.edit_message_text("❌ Черновик отклонён. Ничего не опубликовано.")
+            await finish_preview(query, "❌ Черновик отклонён. Ничего не опубликовано.")
             return
         if action == "approve":
             text = draft["text"]
             media_type, file_id = draft["media_type"], draft["file_id"]
             try:
-                if media_type in ("photo", "video", "animation") and len(text) > 1024:
+                if media_type == "album":
+                    with connect_db() as db:
+                        shown = db.execute("SELECT text,file_id FROM album_previews WHERE draft_id=?", (draft_id,)).fetchone()
+                        incomplete = db.execute("SELECT 1 FROM incomplete_albums WHERE draft_id=? AND file_id=?", (draft_id, file_id)).fetchone()
+                    if incomplete:
+                        await query.message.reply_text("⚠️ Альбом получен не полностью. Нажми «Уточнить» и отправь все фото заново.")
+                        return
+                    if not shown or shown["text"] != text or shown["file_id"] != file_id:
+                        await query.message.reply_text("⚠️ Текущий альбом не показан полностью. Сначала обнови предпросмотр через «Уточнить».")
+                        return
+                if media_type in ("photo", "video", "animation", "album") and caption_length(text) > 1024:
                     # Telegram media captions are limited to 1024 characters.
                     raise ValueError("Подпись длиннее 1024 символов. Перепиши пост.")
-                if media_type == "photo":
+                if media_type == "album":
+                    sent = await ctx.bot.send_media_group(chat_id=CHANNEL_ID, media=album_media(file_id, text))
+                    if len(sent) != len(album_ids(file_id)):
+                        raise RuntimeError("Публикация всех фото не подтверждена")
+                elif media_type == "photo":
                     await ctx.bot.send_photo(chat_id=CHANNEL_ID, photo=file_id, caption=text)
                 elif media_type == "video":
                     await ctx.bot.send_video(chat_id=CHANNEL_ID, video=file_id, caption=text)
@@ -880,21 +1359,31 @@ async def handle_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     await ctx.bot.send_message(chat_id=CHANNEL_ID, text=text)
                 mark_published(draft_id)
                 clear_edit_session(query.message.chat_id)
-                await query.edit_message_text("✅ Опубликовано в канале!")
+                await finish_preview(query, "✅ Опубликовано в канале!")
             except Exception:
                 log.exception("Publishing failed for draft %s", draft_id)
                 await query.message.reply_text("❌ Публикация не подтверждена. Посмотри логи Railway и канал перед повтором.")
         else:
             try:
-                photo = await fetch_photo_bytes(ctx, draft["file_id"]) if draft["media_type"] == "photo" else None
+                photo = await fetch_draft_images(ctx, draft["media_type"], draft["file_id"])
                 new_text = await ai_post(caption=draft["source_caption"], image_bytes=photo,
                                          old_text=draft["text"],
                                          is_video=draft["media_type"] in ("video", "animation"))
                 if not new_text:
                     raise ValueError("Пустой ответ модели")
+                if draft["media_type"] in ("photo", "video", "animation", "album") and caption_length(new_text) > 1024:
+                    raise ValueError("Подпись слишком длинная для фото/видео")
                 update_draft(draft_id, new_text, reason="rewrite")
                 clear_edit_session(query.message.chat_id)
-                await query.edit_message_text(f"📝 Новый вариант:\n\n{new_text}", reply_markup=buttons(draft_id))
+                await send_current_draft_preview(
+                    ctx.bot, query.message.chat_id, query.message.message_id,
+                    draft_id, new_text, draft["media_type"], draft["file_id"])
+                if draft["media_type"] == "album":
+                    await query.message.reply_text(f"✅ Новый текст готов. Все {len(album_ids(draft['file_id']))} фото сохранены.")
+                elif draft["media_type"] in ("photo", "video", "animation") and draft["file_id"]:
+                    await query.message.reply_text(
+                        "✅ Новый вариант готов. Фото/видео осталось прикреплённым; "
+                        "проверь предпросмотр выше перед публикацией.")
             except Exception:
                 log.exception("Rewrite failed for draft %s", draft_id)
                 await query.message.reply_text("❌ Не смогла переписать пост. Попробуй позже.")
